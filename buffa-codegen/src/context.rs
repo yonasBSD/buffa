@@ -293,7 +293,8 @@ fn resolve_extern_prefix(package: &str, extern_paths: &[(String, String)]) -> Op
             return Some(rust_prefix.clone());
         }
         if let Some(rest) = dotted.strip_prefix(proto_prefix.as_str()) {
-            if rest.starts_with('.') {
+            // `"."` is the catch-all root; stripping it leaves no leading dot.
+            if proto_prefix == "." || rest.starts_with('.') {
                 let prefix_len = proto_prefix.len();
                 if best.is_none_or(|(_, _, best_len)| prefix_len > best_len) {
                     best = Some((proto_prefix, rust_prefix, prefix_len));
@@ -303,7 +304,8 @@ fn resolve_extern_prefix(package: &str, extern_paths: &[(String, String)]) -> Op
     }
 
     let (proto_prefix, rust_prefix, _) = best?;
-    let rest = dotted.strip_prefix(proto_prefix)?.strip_prefix('.')?;
+    let rest = dotted.strip_prefix(proto_prefix)?;
+    let rest = rest.strip_prefix('.').unwrap_or(rest);
     let suffix = rest
         .split('.')
         .map(to_snake_case)
@@ -830,6 +832,45 @@ mod tests {
             ],
         );
         assert_eq!(result, Some("::crate_b::sub".into()));
+    }
+
+    #[test]
+    fn test_resolve_extern_prefix_catchall() {
+        let result = resolve_extern_prefix("greet.v1", &[(".".into(), "crate::proto".into())]);
+        assert_eq!(result, Some("crate::proto::greet::v1".into()));
+    }
+
+    #[test]
+    fn test_resolve_extern_prefix_catchall_empty_pkg() {
+        // Empty package with `.` catch-all hits the exact-match branch
+        // (dotted == "." == proto_prefix) and returns the root as-is.
+        let result = resolve_extern_prefix("", &[(".".into(), "crate::proto".into())]);
+        assert_eq!(result, Some("crate::proto".into()));
+    }
+
+    #[test]
+    fn test_resolve_extern_prefix_catchall_longest_wins() {
+        // `.` catch-all is the shortest possible prefix; any more-specific
+        // mapping (including the auto-injected WKT mapping) takes priority.
+        let result = resolve_extern_prefix(
+            "google.protobuf",
+            &[
+                (".".into(), "crate::proto".into()),
+                (
+                    ".google.protobuf".into(),
+                    "::buffa_types::google::protobuf".into(),
+                ),
+            ],
+        );
+        assert_eq!(result, Some("::buffa_types::google::protobuf".into()));
+    }
+
+    #[test]
+    fn test_resolve_extern_prefix_catchall_keyword_package() {
+        // Keyword segments stay unescaped at the string level; escaping to
+        // `r#type` happens later in `idents::rust_path_to_tokens`.
+        let result = resolve_extern_prefix("google.type", &[(".".into(), "crate::proto".into())]);
+        assert_eq!(result, Some("crate::proto::google::type".into()));
     }
 
     #[test]
