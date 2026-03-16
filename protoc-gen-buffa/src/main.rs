@@ -54,7 +54,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("failed to decode CodeGeneratorRequest: {}", e))?;
 
     // Parse plugin parameters (e.g., "views=true,unknown_fields=false").
-    let config = parse_config(request.parameter.as_deref().unwrap_or(""));
+    let config = parse_config(request.parameter.as_deref().unwrap_or(""))?;
 
     // Run code generation.
     let generated = buffa_codegen::generate(
@@ -115,11 +115,11 @@ struct PluginConfig {
 ///
 /// Extern paths use the format `extern_path=<proto>=<rust>`:
 ///   --buffa_opt=extern_path=.my.common=::common_protos
-fn parse_config(params: &str) -> PluginConfig {
+fn parse_config(params: &str) -> Result<PluginConfig, String> {
     let mut codegen = CodeGenConfig::default();
 
     if params.is_empty() {
-        return PluginConfig { codegen };
+        return Ok(PluginConfig { codegen });
     }
 
     for param in params.split(',') {
@@ -150,6 +150,12 @@ fn parse_config(params: &str) -> PluginConfig {
                         );
                     }
                 }
+                "mod_file" => {
+                    return Err("the mod_file option was removed in 0.2; use \
+                         protoc-gen-buffa-packaging instead. See CHANGELOG \
+                         for migration."
+                        .to_string());
+                }
                 other => {
                     eprintln!("protoc-gen-buffa: unknown parameter '{}'", other);
                 }
@@ -157,7 +163,7 @@ fn parse_config(params: &str) -> PluginConfig {
         }
     }
 
-    PluginConfig { codegen }
+    Ok(PluginConfig { codegen })
 }
 
 #[cfg(test)]
@@ -166,7 +172,7 @@ mod tests {
 
     #[test]
     fn empty_params_returns_defaults() {
-        let config = parse_config("");
+        let config = parse_config("").unwrap();
         let defaults = CodeGenConfig::default();
         assert_eq!(config.codegen.generate_views, defaults.generate_views);
         assert_eq!(
@@ -179,37 +185,37 @@ mod tests {
 
     #[test]
     fn views_true() {
-        let config = parse_config("views=true");
+        let config = parse_config("views=true").unwrap();
         assert!(config.codegen.generate_views);
     }
 
     #[test]
     fn views_false() {
-        let config = parse_config("views=false");
+        let config = parse_config("views=false").unwrap();
         assert!(!config.codegen.generate_views);
     }
 
     #[test]
     fn json_true() {
-        let config = parse_config("json=true");
+        let config = parse_config("json=true").unwrap();
         assert!(config.codegen.generate_json);
     }
 
     #[test]
     fn unknown_fields_false() {
-        let config = parse_config("unknown_fields=false");
+        let config = parse_config("unknown_fields=false").unwrap();
         assert!(!config.codegen.preserve_unknown_fields);
     }
 
     #[test]
     fn unknown_fields_true() {
-        let config = parse_config("unknown_fields=true");
+        let config = parse_config("unknown_fields=true").unwrap();
         assert!(config.codegen.preserve_unknown_fields);
     }
 
     #[test]
     fn extern_path_with_leading_dot() {
-        let config = parse_config("extern_path=.my.common=::common_protos");
+        let config = parse_config("extern_path=.my.common=::common_protos").unwrap();
         assert_eq!(config.codegen.extern_paths.len(), 1);
         assert_eq!(config.codegen.extern_paths[0].0, ".my.common");
         assert_eq!(config.codegen.extern_paths[0].1, "::common_protos");
@@ -217,20 +223,21 @@ mod tests {
 
     #[test]
     fn extern_path_without_leading_dot_is_normalized() {
-        let config = parse_config("extern_path=my.common=::common_protos");
+        let config = parse_config("extern_path=my.common=::common_protos").unwrap();
         assert_eq!(config.codegen.extern_paths[0].0, ".my.common");
     }
 
     #[test]
     fn multiple_params() {
-        let config = parse_config("views=true,json=true");
+        let config = parse_config("views=true,json=true").unwrap();
         assert!(config.codegen.generate_views);
         assert!(config.codegen.generate_json);
     }
 
     #[test]
     fn multiple_extern_paths() {
-        let config = parse_config("extern_path=.my.a=::crate_a,extern_path=.my.b=::crate_b");
+        let config =
+            parse_config("extern_path=.my.a=::crate_a,extern_path=.my.b=::crate_b").unwrap();
         assert_eq!(config.codegen.extern_paths.len(), 2);
         assert_eq!(config.codegen.extern_paths[0].0, ".my.a");
         assert_eq!(config.codegen.extern_paths[1].0, ".my.b");
@@ -238,7 +245,7 @@ mod tests {
 
     #[test]
     fn whitespace_is_trimmed() {
-        let config = parse_config(" views = true , json = true ");
+        let config = parse_config(" views = true , json = true ").unwrap();
         assert!(config.codegen.generate_views);
         assert!(config.codegen.generate_json);
     }
@@ -246,7 +253,7 @@ mod tests {
     #[test]
     fn unknown_param_is_ignored() {
         // Should not panic; unknown params produce an eprintln warning.
-        let config = parse_config("unknown_key=value");
+        let config = parse_config("unknown_key=value").unwrap();
         let defaults = CodeGenConfig::default();
         assert_eq!(config.codegen.generate_views, defaults.generate_views);
     }
@@ -254,7 +261,13 @@ mod tests {
     #[test]
     fn invalid_extern_path_is_ignored() {
         // Missing "=" in the value — should not panic.
-        let config = parse_config("extern_path=no_equals_sign");
+        let config = parse_config("extern_path=no_equals_sign").unwrap();
         assert!(config.codegen.extern_paths.is_empty());
+    }
+
+    #[test]
+    fn mod_file_errors_with_migration_hint() {
+        let err = parse_config("mod_file=mod.rs").err().unwrap();
+        assert!(err.contains("protoc-gen-buffa-packaging"));
     }
 }

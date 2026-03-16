@@ -73,3 +73,6 @@ jobs:
 
       - name: Publish protoc-gen-buffa
         run: cargo publish -p protoc-gen-buffa $DRY_RUN_FLAG
+
+      - name: Publish protoc-gen-buffa-packaging
+        run: cargo publish -p protoc-gen-buffa-packaging $DRY_RUN_FLAG
