@@ -64,7 +64,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Build the response.
-    let mut files: Vec<CodeGeneratorResponseFile> = generated
+    let files: Vec<CodeGeneratorResponseFile> = generated
         .iter()
         .map(|g| CodeGeneratorResponseFile {
             name: Some(g.name.clone()),
@@ -72,34 +72,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         })
         .collect();
-
-    // If mod_file is requested, generate a module tree include file.
-    // Build (file_name, package) pairs from the file descriptors.
-    if let Some(ref mod_file_name) = config.mod_file {
-        let entries: Vec<(&str, &str)> = generated
-            .iter()
-            .map(|g| {
-                // Find the file descriptor whose proto path matches this generated file.
-                let package = request
-                    .proto_file
-                    .iter()
-                    .find(|fd| {
-                        fd.name
-                            .as_deref()
-                            .is_some_and(|n| buffa_codegen::proto_path_to_rust_module(n) == g.name)
-                    })
-                    .and_then(|fd| fd.package.as_deref())
-                    .unwrap_or("");
-                (g.name.as_str(), package)
-            })
-            .collect();
-        let content = buffa_codegen::generate_module_tree(&entries, "", true);
-        files.push(CodeGeneratorResponseFile {
-            name: Some(mod_file_name.clone()),
-            content: Some(content),
-            ..Default::default()
-        });
-    }
 
     let response = CodeGeneratorResponse {
         supported_features: Some(feature_flags()),
@@ -134,9 +106,6 @@ fn feature_flags() -> u64 {
 struct PluginConfig {
     /// Code generation options passed to buffa-codegen.
     codegen: CodeGenConfig,
-    /// If set, emit a module tree file with this name alongside the
-    /// per-file outputs. Requires `strategy: all` in buf.gen.yaml.
-    mod_file: Option<String>,
 }
 
 /// Parse the plugin parameter string into a PluginConfig.
@@ -146,15 +115,11 @@ struct PluginConfig {
 ///
 /// Extern paths use the format `extern_path=<proto>=<rust>`:
 ///   --buffa_opt=extern_path=.my.common=::common_protos
-///
-/// Module tree generation:
-///   --buffa_opt=mod_file=_mod.rs
 fn parse_config(params: &str) -> PluginConfig {
     let mut codegen = CodeGenConfig::default();
-    let mut mod_file = None;
 
     if params.is_empty() {
-        return PluginConfig { codegen, mod_file };
+        return PluginConfig { codegen };
     }
 
     for param in params.split(',') {
@@ -168,7 +133,6 @@ fn parse_config(params: &str) -> PluginConfig {
                 "strict_utf8" | "strict_utf8_mapping" => {
                     codegen.strict_utf8_mapping = value.trim() == "true"
                 }
-                "mod_file" => mod_file = Some(value.trim().to_string()),
                 "extern_path" => {
                     // value is "<proto_path>=<rust_path>"
                     if let Some((proto, rust)) = value.split_once('=') {
@@ -193,7 +157,7 @@ fn parse_config(params: &str) -> PluginConfig {
         }
     }
 
-    PluginConfig { codegen, mod_file }
+    PluginConfig { codegen }
 }
 
 #[cfg(test)]
@@ -211,7 +175,6 @@ mod tests {
         );
         assert_eq!(config.codegen.generate_json, defaults.generate_json);
         assert!(config.codegen.extern_paths.is_empty());
-        assert!(config.mod_file.is_none());
     }
 
     #[test]
@@ -245,12 +208,6 @@ mod tests {
     }
 
     #[test]
-    fn mod_file() {
-        let config = parse_config("mod_file=_mod.rs");
-        assert_eq!(config.mod_file, Some("_mod.rs".to_string()));
-    }
-
-    #[test]
     fn extern_path_with_leading_dot() {
         let config = parse_config("extern_path=.my.common=::common_protos");
         assert_eq!(config.codegen.extern_paths.len(), 1);
@@ -266,10 +223,9 @@ mod tests {
 
     #[test]
     fn multiple_params() {
-        let config = parse_config("views=true,json=true,mod_file=mod.rs");
+        let config = parse_config("views=true,json=true");
         assert!(config.codegen.generate_views);
         assert!(config.codegen.generate_json);
-        assert_eq!(config.mod_file, Some("mod.rs".to_string()));
     }
 
     #[test]

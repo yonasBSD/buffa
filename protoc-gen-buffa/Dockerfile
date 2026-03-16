@@ -27,6 +27,7 @@ COPY buffa-codegen/   buffa-codegen/
 COPY buffa-test/      buffa-test/
 COPY buffa-types/     buffa-types/
 COPY protoc-gen-buffa/ protoc-gen-buffa/
+COPY protoc-gen-buffa-packaging/ protoc-gen-buffa-packaging/
 
 RUN cargo build --release --bin protoc-gen-buffa
 

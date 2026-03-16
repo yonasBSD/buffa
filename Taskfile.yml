@@ -458,14 +458,16 @@ tasks:
       - PATH="{{.ROOT_DIR}}/target/release:$PATH" buf generate
 
   build-plugin:
-    desc: Build protoc-gen-buffa in release mode.
+    desc: Build the protoc plugins in release mode.
     cmds:
-      - cargo build --release --bin protoc-gen-buffa
+      - cargo build --release --bin protoc-gen-buffa --bin protoc-gen-buffa-packaging
     sources:
       - buffa-codegen/src/**/*.rs
       - protoc-gen-buffa/src/**/*.rs
+      - protoc-gen-buffa-packaging/src/**/*.rs
     generates:
       - target/release/protoc-gen-buffa
+      - target/release/protoc-gen-buffa-packaging
 
   # ── Cross-target checks ─────────────────────────────────────────
 

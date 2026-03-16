@@ -20,6 +20,7 @@ COPY buffa-codegen/     buffa-codegen/
 COPY buffa-test/        buffa-test/
 COPY buffa-types/       buffa-types/
 COPY protoc-gen-buffa/  protoc-gen-buffa/
+COPY protoc-gen-buffa-packaging/ protoc-gen-buffa-packaging/
 
 # Copy benchmark shared files and the buffa benchmark crate.
 COPY benchmarks/proto/      benchmarks/proto/

@@ -85,9 +85,9 @@ version: v2
 plugins:
   - local: protoc-gen-buffa
     out: src/gen
+  - local: protoc-gen-buffa-packaging
+    out: src/gen
     strategy: all
-    opt:
-      - mod_file=mod.rs
 ```
 
 ```sh
@@ -201,7 +201,7 @@ The proto path must start with `.` (fully qualified), though the leading dot is 
 
 ### Multi-package projects
 
-When your proto files span multiple packages that reference each other, buffa uses `super::`-based relative paths so cross-package types resolve automatically. This works when the module tree matches the protobuf package hierarchy — which `include_file` (for `buffa-build`) and `mod_file` (for `protoc-gen-buffa`) ensure.
+When your proto files span multiple packages that reference each other, buffa uses `super::`-based relative paths so cross-package types resolve automatically. This works when the module tree matches the protobuf package hierarchy — which `include_file` (for `buffa-build`) and `protoc-gen-buffa-packaging` (for the protoc plugin path) ensure.
 
 **Example:** Two packages that reference each other:
 
@@ -218,7 +218,7 @@ message Request {
 }
 ```
 
-With `include_file` or `mod_file`, the generated module tree is:
+With `include_file` or `protoc-gen-buffa-packaging`, the generated module tree is:
 
 ```text
 pub mod myapp {
@@ -268,44 +268,48 @@ This is the standard Rust mechanism for using keywords as identifiers. It applie
 
 **Recursive message types** work automatically: singular message fields use `MessageField<T>` (which is `Option<Box<T>>` internally), and message-typed oneof variants are boxed. Both direct recursion (`message T { oneof k { T self = 1; } }`) and mutual recursion (`A ↔ B`) compile without workarounds.
 
-### Installing `protoc-gen-buffa`
+### Installing the protoc plugins
+
+There are two binaries: `protoc-gen-buffa` (the codegen plugin) and `protoc-gen-buffa-packaging` (the module-tree assembler). Both are released together.
 
 **From source (requires Rust toolchain):**
 
 ```sh
-cargo install --git https://github.com/anthropics/buffa protoc-gen-buffa
+cargo install --git https://github.com/anthropics/buffa protoc-gen-buffa protoc-gen-buffa-packaging
 ```
 
 **From GitHub releases:**
 
-Download the binary for your platform from the [releases page](https://github.com/anthropics/buffa/releases) using the `gh` CLI:
+Download the binaries for your platform from the [releases page](https://github.com/anthropics/buffa/releases) using the `gh` CLI:
 
 ```sh
-# Download binary + cosign signature + certificate
-gh release download v0.1.0 --repo anthropics/buffa \
-    --pattern 'protoc-gen-buffa-*-linux-x86_64*'
+# Download binaries + cosign signatures + certificates (both plugins match)
+gh release download v0.2.0 --repo anthropics/buffa \
+    --pattern 'protoc-gen-buffa*-linux-x86_64*'
 
 # Verify with GitHub attestations (requires gh CLI ≥ 2.49)
-gh attestation verify protoc-gen-buffa-v0.1.0-linux-x86_64 --repo anthropics/buffa
+gh attestation verify protoc-gen-buffa-v0.2.0-linux-x86_64 --repo anthropics/buffa
+gh attestation verify protoc-gen-buffa-packaging-v0.2.0-linux-x86_64 --repo anthropics/buffa
 
-# Or with cosign (standalone, no gh required)
+# Or with cosign (standalone, no gh required) — shown for one binary
 cosign verify-blob \
-    --signature protoc-gen-buffa-v0.1.0-linux-x86_64.sig \
-    --certificate protoc-gen-buffa-v0.1.0-linux-x86_64.pem \
+    --signature protoc-gen-buffa-v0.2.0-linux-x86_64.sig \
+    --certificate protoc-gen-buffa-v0.2.0-linux-x86_64.pem \
     --certificate-identity-regexp "github.com/anthropics/buffa" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    protoc-gen-buffa-v0.1.0-linux-x86_64
+    protoc-gen-buffa-v0.2.0-linux-x86_64
 
-# Install
-chmod +x protoc-gen-buffa-v0.1.0-linux-x86_64
-mv protoc-gen-buffa-v0.1.0-linux-x86_64 ~/.local/bin/protoc-gen-buffa
+# Install both
+chmod +x protoc-gen-buffa-v0.2.0-linux-x86_64 protoc-gen-buffa-packaging-v0.2.0-linux-x86_64
+mv protoc-gen-buffa-v0.2.0-linux-x86_64 ~/.local/bin/protoc-gen-buffa
+mv protoc-gen-buffa-packaging-v0.2.0-linux-x86_64 ~/.local/bin/protoc-gen-buffa-packaging
 ```
 
 Available platforms: `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-aarch64`, `windows-x86_64` (`.exe`). All releases include SHA-256 checksums, Sigstore cosign signatures, and signed SLSA build provenance for supply chain verification.
 
 ### Using buf
 
-[buf](https://buf.build/docs/cli/) is the recommended way to use `protoc-gen-buffa`. It has a built-in protobuf compiler and handles dependency management, so no separate `protoc` install is needed.
+[buf](https://buf.build/docs/cli/) is the recommended way to invoke the plugins. It has a built-in protobuf compiler and handles dependency management, so no separate `protoc` install is needed.
 
 Create a `buf.gen.yaml`:
 
@@ -314,9 +318,9 @@ version: v2
 plugins:
   - local: protoc-gen-buffa
     out: src/gen
+  - local: protoc-gen-buffa-packaging
+    out: src/gen
     strategy: all
-    opt:
-      - mod_file=mod.rs
 ```
 
 Then run:
@@ -325,7 +329,7 @@ Then run:
 buf generate
 ```
 
-This generates per-package `.rs` files plus a `mod.rs` module tree in `src/gen/`. Include the module in your crate:
+This generates per-file `.rs` output plus a `mod.rs` module tree in `src/gen/`. Include the module in your crate:
 
 ```rust,ignore
 // src/main.rs or src/lib.rs
@@ -334,9 +338,9 @@ mod gen;  // no #[allow] needed — the generated mod.rs handles it
 
 No hand-written bridge file is needed. The generated `mod.rs` includes `#![allow(...)]` for generated code lints and sets up the full module hierarchy.
 
-**`strategy: all`** is required when using `mod_file` — it sends all proto files in a single invocation so the plugin can generate a complete module tree. Without it, buf invokes the plugin once per file and the plugin can't see the full set of packages.
+**`protoc-gen-buffa`** emits one `.rs` file per proto file. It does not emit `mod.rs` and does not require `strategy: all` — buf can invoke it per-directory.
 
-**`mod_file=mod.rs`** generates a module tree file with nested `pub mod` blocks matching the protobuf package hierarchy, plus `#![allow(...)]` attributes for generated code lints. Cross-package type references use `super::` relative paths within this tree, so sibling packages resolve automatically without `extern_path`. Using `mod.rs` as the file name means the generated file serves directly as the Rust module file — no hand-written bridge file needed.
+**`protoc-gen-buffa-packaging`** reads the full proto file set (hence `strategy: all`) and emits a `mod.rs` with nested `pub mod` blocks that `include!` each generated file at the right package nesting. Cross-package type references use `super::` relative paths within this tree, so sibling packages resolve automatically without `extern_path`. Run it once per output directory; if you have multiple codegen plugins emitting to different directories, invoke it once per directory with the appropriate `out:`.
 
 Plugin options (passed via `opt:`):
 
@@ -347,7 +351,6 @@ Plugin options (passed via `opt:`):
 | `unknown_fields=false` | Disable unknown field preservation |
 | `arbitrary=true` | Emit `#[derive(arbitrary::Arbitrary)]` for fuzzing |
 | `extern_path=.pkg=::rust` | Map a proto package to an external Rust path |
-| `mod_file=mod.rs` | Generate a module tree file (requires `strategy: all`) |
 
 **Remote plugin (planned):** Once published to the Buf Schema Registry, the plugin will be available as a remote plugin without requiring a local install:
 

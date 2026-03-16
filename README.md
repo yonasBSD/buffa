@@ -63,16 +63,16 @@ The generated code API (struct shapes, `Message` trait, `MessageView` trait, `En
 
 ### Using `buf generate` (recommended)
 
-Install [buf](https://buf.build/docs/installation) and [protoc-gen-buffa](docs/guide.md#installing-protoc-gen-buffa), then create a `buf.gen.yaml`:
+Install [buf](https://buf.build/docs/installation) and [the protoc plugins](docs/guide.md#installing-the-protoc-plugins), then create a `buf.gen.yaml`:
 
 ```yaml
 version: v2
 plugins:
   - local: protoc-gen-buffa
     out: src/gen
+  - local: protoc-gen-buffa-packaging
+    out: src/gen
     strategy: all
-    opt:
-      - mod_file=mod.rs
 ```
 
 ```sh

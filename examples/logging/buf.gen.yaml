@@ -4,7 +4,8 @@ inputs:
 plugins:
   - local: protoc-gen-buffa
     out: src/gen
-    strategy: all
     opt:
       - views=false
-      - mod_file=mod.rs
+  - local: protoc-gen-buffa-packaging
+    out: src/gen
+    strategy: all
