@@ -40,13 +40,82 @@ use crate::generated::descriptor::FileDescriptorProto;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-/// Result of generating Rust code for a single `.proto` file.
+/// Lints suppressed on generated code at module boundaries.
+///
+/// Consumed by [`generate_module_tree`], the per-package `.mod.rs`
+/// stitcher, and `buffa-build`'s `_include.rs` writer. One list keeps
+/// them in sync.
+pub const ALLOW_LINTS: &[&str] = &[
+    "non_camel_case_types",
+    "dead_code",
+    "unused_imports",
+    "clippy::derivable_impls",
+    "clippy::match_single_binding",
+    "clippy::uninlined_format_args",
+    "clippy::doc_lazy_continuation",
+    // A user `message View { message Inner }` produces
+    // `__buffa::view::view::InnerView`; harmless but trips this lint.
+    "clippy::module_inception",
+];
+
+/// Render [`ALLOW_LINTS`] as a `#[allow(…)]` attribute token stream.
+pub fn allow_lints_attr() -> TokenStream {
+    let lints: Vec<TokenStream> = ALLOW_LINTS
+        .iter()
+        .map(|l| syn::parse_str(l).expect("lint name parses as path"))
+        .collect();
+    quote! { #[allow( #(#lints),* )] }
+}
+
+/// One generated output file.
+///
+/// Each `.proto` produces five **content files** (`<stem>.rs`,
+/// `<stem>.__view.rs`, `<stem>.__oneof.rs`, `<stem>.__view_oneof.rs`,
+/// `<stem>.__ext.rs`) and each proto package produces one
+/// `<dotted.pkg>.mod.rs` **stitcher** that `include!`s the content files
+/// and authors the `pub mod __buffa { … }` ancillary tree.
+/// See `DESIGN.md` → "Generated code layout".
+///
+/// Consumers normally only need to wire up the
+/// [`GeneratedFileKind::PackageMod`] entries (one per package); the five
+/// per-proto content kinds are reached transitively via `include!` from
+/// the stitcher. Write all files to disk; build a module tree from only
+/// the `PackageMod` ones.
 #[derive(Debug)]
 pub struct GeneratedFile {
-    /// The output file path (e.g., "my_package.rs").
+    /// The output file path (e.g., `"my.pkg.foo.rs"` or `"my.pkg.mod.rs"`).
     pub name: String,
+    /// The proto package this file belongs to.
+    pub package: String,
+    /// What this file contains. Build integrations only need to wire up
+    /// [`GeneratedFileKind::PackageMod`] files; everything else is reached
+    /// via `include!` from there.
+    pub kind: GeneratedFileKind,
     /// The generated Rust source code.
     pub content: String,
+}
+
+/// Kind of [`GeneratedFile`]. The five content kinds are 1:1 with input
+/// `.proto` files; `PackageMod` is 1:1 with packages.
+///
+/// Build integrations only need to wire up [`PackageMod`](Self::PackageMod)
+/// entries — the per-proto content kinds are reached via `include!` from
+/// the stitcher and need only be written to disk alongside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedFileKind {
+    /// Owned message structs and enums (`<stem>.rs`).
+    Owned,
+    /// View structs (`<stem>.__view.rs`).
+    View,
+    /// Owned oneof enums (`<stem>.__oneof.rs`).
+    Oneof,
+    /// View oneof enums (`<stem>.__view_oneof.rs`).
+    ViewOneof,
+    /// File-level extension consts (`<stem>.__ext.rs`).
+    Ext,
+    /// Per-package stitcher (`<dotted.pkg>.mod.rs`). The only file build
+    /// systems need to wire up directly.
+    PackageMod,
 }
 
 /// Configuration for code generation.
@@ -127,14 +196,16 @@ pub struct CodeGenConfig {
     /// When this is `true`, the downstream crate must enable the `buffa/text`
     /// feature for the runtime encoder/decoder.
     pub generate_text: bool,
-    /// Whether to emit the file-level `register_types(&mut TypeRegistry)` fn.
+    /// Whether the per-package `.mod.rs` stitcher emits
+    /// `__buffa::register_types(&mut TypeRegistry)`.
     ///
-    /// Default `true`. Set to `false` when multiple generated files are
-    /// `include!`d into the same namespace (the identically-named fns would
-    /// collide) — e.g. `buffa-types`' WKTs, which hand-roll
-    /// `register_wkt_types` instead. The per-message `__*_JSON_ANY` /
-    /// `__*_TEXT_ANY` consts are still emitted; only the aggregating fn
-    /// is suppressed.
+    /// Default `true`. The fn aggregates `Any` type entries and extension
+    /// entries for every message in the package. Set to `false` for
+    /// crates that don't use extensions/`Any`, or that hand-roll
+    /// registration (e.g. `buffa-types`' `register_wkt_types`, which
+    /// knows the JSON-Any `is_wkt` special-casing the generic fn does
+    /// not). The per-message `__*_JSON_ANY` / `__*_TEXT_ANY` consts are
+    /// still emitted; only the aggregating fn is suppressed.
     pub emit_register_fn: bool,
     /// Custom attributes to inject on generated types (messages and enums).
     ///
@@ -236,6 +307,10 @@ pub(crate) fn effective_extern_paths(
 /// (matching `CodeGeneratorRequest.file_to_generate`). Descriptors for
 /// dependencies may be present in `file_descriptors` but won't produce output
 /// files unless they appear in `files_to_generate`.
+///
+/// Each `.proto` emits five content files; each distinct package emits one
+/// `<pkg>.mod.rs` stitcher. Packages are processed in sorted order for
+/// deterministic output.
 pub fn generate(
     file_descriptors: &[FileDescriptorProto],
     files_to_generate: &[String],
@@ -243,44 +318,43 @@ pub fn generate(
 ) -> Result<Vec<GeneratedFile>, CodeGenError> {
     let ctx = context::CodeGenContext::for_generate(file_descriptors, files_to_generate, config);
 
-    let mut output = Vec::new();
+    // Group requested files by package. BTreeMap → deterministic output order.
+    let mut by_package: std::collections::BTreeMap<String, Vec<&FileDescriptorProto>> =
+        std::collections::BTreeMap::new();
     for file_name in files_to_generate {
         let file_desc = file_descriptors
             .iter()
             .find(|f| f.name.as_deref() == Some(file_name.as_str()))
             .ok_or_else(|| CodeGenError::FileNotFound(file_name.clone()))?;
+        let pkg = file_desc.package.as_deref().unwrap_or("").to_string();
+        by_package.entry(pkg).or_default().push(file_desc);
+    }
 
-        let content = generate_file(&ctx, file_desc)?;
-        let rust_filename = proto_path_to_rust_module(file_name);
-        output.push(GeneratedFile {
-            name: rust_filename,
-            content,
-        });
+    let mut output = Vec::new();
+    for (package, files) in by_package {
+        generate_package(&ctx, &package, &files, &mut output)?;
     }
 
     Ok(output)
 }
 
-/// Generate a module tree that assembles generated `.rs` files into
+/// Generate a module tree that assembles per-package `.mod.rs` files into
 /// nested `pub mod` blocks matching the protobuf package hierarchy.
 ///
-/// Each entry is a `(file_name, package)` pair where `package` is the
-/// dot-separated protobuf package name (e.g., `"google.api"`). The module
-/// tree is built from the **package** hierarchy so that `super::`-based
-/// cross-package references resolve correctly.
+/// Each entry is a `(mod_file_name, package)` pair where `package` is the
+/// dot-separated protobuf package name (e.g., `"google.api"`) and
+/// `mod_file_name` is the corresponding `<pkg>.mod.rs` (only
+/// [`GeneratedFileKind::PackageMod`] outputs need wiring; per-proto
+/// content files are reached via `include!` from the stitcher).
 ///
-/// `include_prefix` is prepended to file names in `include!` directives.
-/// Use `""` for relative paths or `concat!(env!("OUT_DIR"), "/")` style
-/// for build.rs output.
+/// `include_mode` controls how `include!` paths are emitted.
 ///
-/// When `emit_inner_allow` is true, a `#![allow(...)]` inner attribute is
-/// emitted at the top of the file. This is appropriate when the output is
-/// used directly as a module file (e.g., `mod.rs`) but NOT when the output
-/// is consumed via `include!` (inner attributes are not valid in that
-/// context).
-pub fn generate_module_tree(
-    entries: &[(&str, &str)],
-    include_prefix: &str,
+/// `emit_inner_allow` adds a `#![allow(...)]` inner attribute at the top —
+/// valid when the output is used directly as a module file (`mod.rs`),
+/// invalid when consumed via `include!`.
+pub fn generate_module_tree<F: AsRef<str>, P: AsRef<str>>(
+    entries: &[(F, P)],
+    include_mode: IncludeMode<'_>,
     emit_inner_allow: bool,
 ) -> String {
     use std::collections::BTreeMap;
@@ -297,6 +371,7 @@ pub fn generate_module_tree(
     let mut root = ModNode::default();
 
     for (file_name, package) in entries {
+        let package = package.as_ref();
         let pkg_parts: Vec<&str> = if package.is_empty() {
             vec![]
         } else {
@@ -307,97 +382,132 @@ pub fn generate_module_tree(
         for seg in &pkg_parts {
             node = node.children.entry(seg.to_string()).or_default();
         }
-        node.files.push(file_name.to_string());
+        node.files.push(file_name.as_ref().to_string());
     }
 
+    let lints = ALLOW_LINTS.join(", ");
     let mut out = String::new();
-    writeln!(out, "// @generated by buffa. DO NOT EDIT.").unwrap();
-    const ALLOW_LINTS: &str = "non_camel_case_types, dead_code, unused_imports, \
-        clippy::derivable_impls, clippy::match_single_binding, \
-        clippy::uninlined_format_args, clippy::doc_lazy_continuation";
-
+    let _ = writeln!(out, "// @generated by buffa-codegen. DO NOT EDIT.");
     if emit_inner_allow {
-        writeln!(out, "#![allow({ALLOW_LINTS})]").unwrap();
+        let _ = writeln!(out, "#![allow({lints})]");
     }
-    writeln!(out).unwrap();
+    let _ = writeln!(out);
 
-    fn emit(out: &mut String, node: &ModNode, depth: usize, prefix: &str, lints: &str) {
+    fn emit(out: &mut String, node: &ModNode, depth: usize, mode: IncludeMode<'_>, lints: &str) {
         let indent = "    ".repeat(depth);
 
         for file in &node.files {
-            writeln!(out, r#"{indent}include!("{prefix}{file}");"#).unwrap();
-        }
-
-        for (name, child) in &node.children {
-            let escaped = escape_mod_ident(name);
-            writeln!(out, "{indent}#[allow({lints})]").unwrap();
-            writeln!(out, "{indent}pub mod {escaped} {{").unwrap();
-            writeln!(out, "{indent}    use super::*;").unwrap();
-            emit(out, child, depth + 1, prefix, lints);
-            writeln!(out, "{indent}}}").unwrap();
-        }
-    }
-
-    emit(&mut out, &root, 0, include_prefix, ALLOW_LINTS);
-    out
-}
-
-/// Check that no fields in the file use the `__buffa_` reserved prefix.
-fn check_reserved_field_names(file: &FileDescriptorProto) -> Result<(), CodeGenError> {
-    fn check_message(
-        msg: &crate::generated::descriptor::DescriptorProto,
-        parent_name: &str,
-    ) -> Result<(), CodeGenError> {
-        let msg_name = msg.name.as_deref().unwrap_or("");
-        let fqn = if parent_name.is_empty() {
-            msg_name.to_string()
-        } else {
-            format!("{}.{}", parent_name, msg_name)
-        };
-
-        for field in &msg.field {
-            if let Some(name) = &field.name {
-                if name.starts_with("__buffa_") {
-                    return Err(CodeGenError::ReservedFieldName {
-                        message_name: fqn,
-                        field_name: name.clone(),
-                    });
+            match mode {
+                IncludeMode::Relative(prefix) => {
+                    let _ = writeln!(out, r#"{indent}include!("{prefix}{file}");"#);
+                }
+                IncludeMode::OutDir => {
+                    let _ = writeln!(
+                        out,
+                        r#"{indent}include!(concat!(env!("OUT_DIR"), "/{file}"));"#
+                    );
                 }
             }
         }
 
-        for nested in &msg.nested_type {
-            check_message(nested, &fqn)?;
+        for (name, child) in &node.children {
+            let escaped = escape_mod_ident(name);
+            let _ = writeln!(out, "{indent}#[allow({lints})]");
+            let _ = writeln!(out, "{indent}pub mod {escaped} {{");
+            let _ = writeln!(out, "{indent}    use super::*;");
+            emit(out, child, depth + 1, mode, lints);
+            let _ = writeln!(out, "{indent}}}");
         }
-
-        Ok(())
     }
 
-    let package = file.package.as_deref().unwrap_or("");
-    for msg in &file.message_type {
-        check_message(msg, package)?;
-    }
-    Ok(())
+    emit(&mut out, &root, 0, include_mode, &lints);
+    out
 }
 
-/// Check that no sibling messages produce the same snake_case module name.
+/// How [`generate_module_tree`] emits `include!` paths.
+#[derive(Debug, Clone, Copy)]
+pub enum IncludeMode<'a> {
+    /// `include!("<prefix><file>")` — relative to the including file.
+    /// Prefix is typically `""` or `"gen/"`.
+    Relative(&'a str),
+    /// `include!(concat!(env!("OUT_DIR"), "/<file>"))` — for build.rs output.
+    OutDir,
+}
+
+/// Validate one input descriptor before generating code for it.
 ///
-/// For example, `HTTPRequest` and `HttpRequest` both produce
-/// `pub mod http_request`, which would be a compile error.
-fn check_module_name_conflicts(file: &FileDescriptorProto) -> Result<(), CodeGenError> {
+/// Checks, in one walk of the message tree:
+///
+/// - **Reserved field names**: no field starts with `__buffa_` (would clash
+///   with generated `__buffa_unknown_fields` / `__buffa_cached_size`).
+/// - **Module-name conflicts**: no two sibling messages snake_case to the
+///   same module name (e.g. `HTTPRequest` vs `HttpRequest`).
+/// - **Reserved sentinel**: no package segment, message-module name, or
+///   file-level enum name equals [`SENTINEL_MOD`](context::SENTINEL_MOD).
+///   Ancillary types live under `pkg::__buffa::…`; a proto element
+///   emitting an item named `__buffa` at package root would produce
+///   E0428 against `pub mod __buffa`. This is the only name buffa
+///   reserves in user namespace.
+fn validate_file(file: &FileDescriptorProto) -> Result<(), CodeGenError> {
     use std::collections::HashMap;
 
-    fn check_siblings(
+    let sentinel = context::SENTINEL_MOD;
+    let package = file.package.as_deref().unwrap_or("");
+    if package.split('.').any(|seg| seg == sentinel) {
+        return Err(CodeGenError::ReservedModuleName {
+            name: sentinel.to_string(),
+            location: format!("package '{package}'"),
+        });
+    }
+    // File-level enums emit `pub enum <name>` at package root with the
+    // proto name preserved verbatim (no PascalCase normalization), so a
+    // proto `enum __buffa` would land beside `pub mod __buffa`. Nested
+    // enums live inside their owner message's module and cannot collide
+    // with the package-root sentinel, so only file-level is checked.
+    for enum_type in &file.enum_type {
+        let name = enum_type.name.as_deref().unwrap_or("");
+        if name == sentinel {
+            return Err(CodeGenError::ReservedModuleName {
+                name: sentinel.to_string(),
+                location: format!("enum '{package}.{name}'"),
+            });
+        }
+    }
+
+    fn walk(
         messages: &[crate::generated::descriptor::DescriptorProto],
         scope: &str,
+        sentinel: &str,
     ) -> Result<(), CodeGenError> {
-        // Map from snake_case module name → original proto name.
+        // snake_case module name → original proto name (for conflict diag).
         let mut seen: HashMap<String, &str> = HashMap::new();
 
         for msg in messages {
             let name = msg.name.as_deref().unwrap_or("");
-            let module_name = crate::oneof::to_snake_case(name);
+            let fqn = if scope.is_empty() {
+                name.to_string()
+            } else {
+                format!("{scope}.{name}")
+            };
 
+            for field in &msg.field {
+                if let Some(fname) = &field.name {
+                    if fname.starts_with("__buffa_") {
+                        return Err(CodeGenError::ReservedFieldName {
+                            message_name: fqn,
+                            field_name: fname.clone(),
+                        });
+                    }
+                }
+            }
+
+            let module_name = crate::oneof::to_snake_case(name);
+            if module_name == sentinel {
+                return Err(CodeGenError::ReservedModuleName {
+                    name: sentinel.to_string(),
+                    location: format!("message '{fqn}'"),
+                });
+            }
             if let Some(existing) = seen.get(&module_name) {
                 return Err(CodeGenError::ModuleNameConflict {
                     scope: scope.to_string(),
@@ -408,81 +518,45 @@ fn check_module_name_conflicts(file: &FileDescriptorProto) -> Result<(), CodeGen
             }
             seen.insert(module_name, name);
 
-            // Recurse into nested messages.
-            let child_scope = if scope.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}.{}", scope, name)
-            };
-            check_siblings(&msg.nested_type, &child_scope)?;
+            walk(&msg.nested_type, &fqn, sentinel)?;
         }
-
         Ok(())
     }
 
-    let package = file.package.as_deref().unwrap_or("");
-    check_siblings(&file.message_type, package)
+    walk(&file.message_type, package, sentinel)
 }
 
-/// Check that no message named `FooView` collides with the generated view
-/// type for a sibling message `Foo`.
-fn check_view_name_conflicts(file: &FileDescriptorProto) -> Result<(), CodeGenError> {
-    use std::collections::HashSet;
-
-    fn check_siblings(
-        messages: &[crate::generated::descriptor::DescriptorProto],
-        scope: &str,
-    ) -> Result<(), CodeGenError> {
-        // Collect all message names at this level.
-        let names: HashSet<&str> = messages.iter().filter_map(|m| m.name.as_deref()).collect();
-
-        // For each message Foo, check if FooView also exists.
-        for msg in messages {
-            let name = msg.name.as_deref().unwrap_or("");
-            let view_name = format!("{}View", name);
-            if names.contains(view_name.as_str()) {
-                return Err(CodeGenError::ViewNameConflict {
-                    scope: scope.to_string(),
-                    owned_msg: name.to_string(),
-                    view_msg: view_name,
-                });
-            }
-        }
-
-        // Recurse into nested messages.
-        for msg in messages {
-            let name = msg.name.as_deref().unwrap_or("");
-            let child_scope = if scope.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}.{}", scope, name)
-            };
-            check_siblings(&msg.nested_type, &child_scope)?;
-        }
-
-        Ok(())
-    }
-
-    let package = file.package.as_deref().unwrap_or("");
-    check_siblings(&file.message_type, package)
+/// Per-proto content streams plus the file stem, ready to be formatted.
+struct ProtoContent {
+    stem: String,
+    owned: TokenStream,
+    view: TokenStream,
+    oneof: TokenStream,
+    view_oneof: TokenStream,
+    ext: TokenStream,
 }
 
-/// Generate Rust source for a single `.proto` file.
-fn generate_file(
+/// Generate the five per-`.proto` content files for one input file.
+fn generate_proto_content(
     ctx: &context::CodeGenContext,
+    current_package: &str,
     file: &FileDescriptorProto,
-) -> Result<String, CodeGenError> {
-    // Validate descriptors before generating code.
-    check_reserved_field_names(file)?;
-    check_module_name_conflicts(file)?;
-    if ctx.config.generate_views {
-        check_view_name_conflicts(file)?;
-    }
+    reg: &mut message::RegistryPaths,
+) -> Result<ProtoContent, CodeGenError> {
+    use crate::idents::make_field_ident;
+    use crate::message::MessageOutput;
+
+    validate_file(file)?;
 
     let resolver = imports::ImportResolver::for_file(file);
-    let mut tokens = resolver.generate_use_block();
-    let current_package = file.package.as_deref().unwrap_or("");
     let features = crate::features::for_file(file);
+
+    let mut owned = resolver.generate_use_block();
+    let mut view = TokenStream::new();
+    let mut oneof = TokenStream::new();
+    let mut view_oneof = TokenStream::new();
+    let mut ext = TokenStream::new();
+
     for enum_type in &file.enum_type {
         let enum_rust_name = enum_type.name.as_deref().unwrap_or("");
         let enum_fqn = if current_package.is_empty() {
@@ -490,7 +564,7 @@ fn generate_file(
         } else {
             format!("{}.{}", current_package, enum_rust_name)
         };
-        tokens.extend(enumeration::generate_enum(
+        owned.extend(enumeration::generate_enum(
             ctx,
             enum_type,
             enum_rust_name,
@@ -499,11 +573,6 @@ fn generate_file(
             &resolver,
         )?);
     }
-    // Collect paths to registry consts (both file-level and nested-in-message)
-    // for the optional `register_types` fn below. JSON/text are tracked
-    // separately so each registration line is emitted only under its
-    // corresponding `generate_*` flag.
-    let mut reg = message::RegistryPaths::default();
 
     for message_type in &file.message_type {
         let top_level_name = message_type.name.as_deref().unwrap_or("");
@@ -512,7 +581,14 @@ fn generate_file(
         } else {
             format!("{}.{}", current_package, top_level_name)
         };
-        let (msg_top, msg_mod, msg_reg) = message::generate_message(
+        let MessageOutput {
+            owned_top,
+            owned_mod,
+            oneof_tree: msg_oneof,
+            view_tree: msg_view,
+            view_oneof_tree: msg_view_oneof,
+            reg: msg_reg,
+        } = message::generate_message(
             ctx,
             message_type,
             current_package,
@@ -521,114 +597,240 @@ fn generate_file(
             &features,
             &resolver,
         )?;
-        tokens.extend(msg_top);
-        // Nested extension const paths are relative to the message's module
-        // scope; prefix with `<mod_ident>::` for the package-level view.
-        let mod_name = crate::oneof::to_snake_case(top_level_name);
-        let mod_ident = crate::message::make_field_ident(&mod_name);
+        owned.extend(owned_top);
+        let mod_ident = make_field_ident(&crate::oneof::to_snake_case(top_level_name));
         for p in msg_reg.json_ext {
             reg.json_ext.push(quote! { #mod_ident :: #p });
         }
         for p in msg_reg.text_ext {
             reg.text_ext.push(quote! { #mod_ident :: #p });
         }
-        // Any-entry paths are already relative to the struct's scope
-        // (= file scope for top-level messages) — no prefix needed.
         reg.json_any.extend(msg_reg.json_any);
         reg.text_any.extend(msg_reg.text_any);
 
-        let view_mod = if ctx.config.generate_views {
-            let (view_top, view_mod) = view::generate_view(
-                ctx,
-                message_type,
-                current_package,
-                top_level_name,
-                &proto_fqn,
-                &features,
-            )?;
-            tokens.extend(view_top);
-            view_mod
-        } else {
-            TokenStream::new()
-        };
-
-        // Combine message and view module items into a single `pub mod`.
-        if !msg_mod.is_empty() || !view_mod.is_empty() {
-            tokens.extend(quote! {
+        if !owned_mod.is_empty() {
+            owned.extend(quote! {
                 pub mod #mod_ident {
                     #[allow(unused_imports)]
                     use super::*;
-                    #msg_mod
-                    #view_mod
+                    #owned_mod
                 }
             });
         }
+        oneof.extend(msg_oneof);
+        view.extend(msg_view);
+        view_oneof.extend(msg_view_oneof);
     }
 
+    // File-level `extend` declarations → `__buffa::ext::` (depth 2).
     let (file_ext_tokens, file_ext_json, file_ext_text) = extension::generate_extensions(
         ctx,
         &file.extension,
         current_package,
-        0,
+        2,
         &features,
         current_package,
     )?;
-    tokens.extend(file_ext_tokens);
+    ext.extend(file_ext_tokens);
+    let sentinel = make_field_ident(context::SENTINEL_MOD);
     for id in file_ext_json {
-        reg.json_ext.push(quote! { #id });
+        reg.json_ext.push(quote! { #sentinel :: ext :: #id });
     }
     for id in file_ext_text {
-        reg.text_ext.push(quote! { #id });
+        reg.text_ext.push(quote! { #sentinel :: ext :: #id });
     }
 
-    // `register_types(&mut TypeRegistry)` — one call per entry, split by
-    // format. Only emitted when at least one entry exists. Lines are
-    // gated at codegen time by `generate_json` / `generate_text`; the
-    // corresponding `register_*` methods on `TypeRegistry` are feature-gated
-    // in buffa, so a flag/feature mismatch surfaces as a compile error.
-    if ctx.config.emit_register_fn && !reg.is_empty() {
+    Ok(ProtoContent {
+        stem: proto_path_to_stem(file.name.as_deref().unwrap_or("")),
+        owned,
+        view,
+        oneof,
+        view_oneof,
+        ext,
+    })
+}
+
+/// Generate all output files for one proto package: five content files per
+/// `.proto` plus one `<pkg>.mod.rs` stitcher.
+fn generate_package(
+    ctx: &context::CodeGenContext,
+    current_package: &str,
+    files: &[&FileDescriptorProto],
+    out: &mut Vec<GeneratedFile>,
+) -> Result<(), CodeGenError> {
+    // Registry paths are package-root-relative; `register_types` lives at
+    // `__buffa::register_types` (one level deep), so each path gets a
+    // single `super::` prefix when emitted into the fn body.
+    let mut reg = message::RegistryPaths::default();
+    let mut stems: Vec<String> = Vec::new();
+
+    for file in files {
+        let pc = generate_proto_content(ctx, current_package, file, &mut reg)?;
+        let source = file.name.as_deref().unwrap_or("");
+        let push = |out: &mut Vec<GeneratedFile>,
+                    suffix: &str,
+                    kind: GeneratedFileKind,
+                    tokens: TokenStream|
+         -> Result<(), CodeGenError> {
+            out.push(GeneratedFile {
+                name: format!("{}{suffix}.rs", pc.stem),
+                package: current_package.to_string(),
+                kind,
+                content: format_tokens(tokens, source)?,
+            });
+            Ok(())
+        };
+        push(out, "", GeneratedFileKind::Owned, pc.owned)?;
+        push(out, ".__view", GeneratedFileKind::View, pc.view)?;
+        push(out, ".__oneof", GeneratedFileKind::Oneof, pc.oneof)?;
+        push(
+            out,
+            ".__view_oneof",
+            GeneratedFileKind::ViewOneof,
+            pc.view_oneof,
+        )?;
+        push(out, ".__ext", GeneratedFileKind::Ext, pc.ext)?;
+        stems.push(pc.stem);
+    }
+
+    out.push(GeneratedFile {
+        name: package_to_mod_filename(current_package),
+        package: current_package.to_string(),
+        kind: GeneratedFileKind::PackageMod,
+        content: generate_package_mod(ctx, &stems, &reg)?,
+    });
+
+    Ok(())
+}
+
+/// Render the per-package `<pkg>.mod.rs` stitcher.
+///
+/// `include!` paths are bare-sibling (no `OUT_DIR` prefix) so the same
+/// stitcher works for both `OUT_DIR` builds (where the consumer's
+/// `include_proto!` already prepended `OUT_DIR`) and checked-in code.
+fn generate_package_mod(
+    ctx: &context::CodeGenContext,
+    stems: &[String],
+    reg: &message::RegistryPaths,
+) -> Result<String, CodeGenError> {
+    use crate::idents::make_field_ident;
+
+    let includes = |suffix: &str| -> Vec<TokenStream> {
+        stems
+            .iter()
+            .map(|stem| {
+                let path = format!("{stem}{suffix}.rs");
+                quote! { include!(#path); }
+            })
+            .collect()
+    };
+
+    let owned = includes("");
+    let view = includes(".__view");
+    let view_oneof = includes(".__view_oneof");
+    let oneof = includes(".__oneof");
+    let ext = includes(".__ext");
+
+    let view_mod = if ctx.config.generate_views {
+        quote! {
+            pub mod view {
+                #[allow(unused_imports)]
+                use super::*;
+                #(#view)*
+                pub mod oneof {
+                    #[allow(unused_imports)]
+                    use super::*;
+                    #(#view_oneof)*
+                }
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let register_fn = if ctx.config.emit_register_fn && !reg.is_empty() {
         let json_any = &reg.json_any;
         let json_ext = &reg.json_ext;
         let text_any = &reg.text_any;
         let text_ext = &reg.text_ext;
-        tokens.extend(quote! {
-            /// Register this file's `Any` type entries and extension entries
-            /// (JSON and/or text, per codegen config) with the given registry.
+        quote! {
+            /// Register this package's `Any` type entries and extension entries.
             pub fn register_types(reg: &mut ::buffa::type_registry::TypeRegistry) {
-                #( reg.register_json_any(#json_any); )*
-                #( reg.register_json_ext(#json_ext); )*
-                #( reg.register_text_any(#text_any); )*
-                #( reg.register_text_ext(#text_ext); )*
+                #( reg.register_json_any(super::#json_any); )*
+                #( reg.register_json_ext(super::#json_ext); )*
+                #( reg.register_text_any(super::#text_any); )*
+                #( reg.register_text_ext(super::#text_ext); )*
             }
-        });
-    }
+        }
+    } else {
+        TokenStream::new()
+    };
 
-    // Parse the token stream into a syn::File and format with prettyplease.
-    // Regular `//` comments cannot appear inside quote! blocks, so the file
-    // header is prepended as a raw string after formatting.
+    let allow = allow_lints_attr();
+    let sentinel = make_field_ident(context::SENTINEL_MOD);
+    let tokens = quote! {
+        #(#owned)*
+        #allow
+        pub mod #sentinel {
+            #[allow(unused_imports)]
+            use super::*;
+            #view_mod
+            pub mod oneof {
+                #[allow(unused_imports)]
+                use super::*;
+                #(#oneof)*
+            }
+            pub mod ext {
+                #[allow(unused_imports)]
+                use super::*;
+                #(#ext)*
+            }
+            #register_fn
+        }
+    };
+
+    format_tokens(tokens, "")
+}
+
+/// Format a token stream into a generated-file string with the standard
+/// header comment.
+fn format_tokens(tokens: TokenStream, source: &str) -> Result<String, CodeGenError> {
     let syntax_tree =
         syn::parse2::<syn::File>(tokens).map_err(|e| CodeGenError::InvalidSyntax(e.to_string()))?;
     let formatted = prettyplease::unparse(&syntax_tree);
-
-    let source_line = file
-        .name
-        .as_ref()
-        .map_or(String::new(), |n| format!("// source: {n}\n"));
-
+    let source_line = if source.is_empty() {
+        String::new()
+    } else {
+        format!("// source: {source}\n")
+    };
     Ok(format!(
-        "// @generated by protoc-gen-buffa. DO NOT EDIT.\n{source_line}\n{formatted}"
+        "// @generated by buffa-codegen. DO NOT EDIT.\n{source_line}\n{formatted}"
     ))
 }
 
-/// Convert a `.proto` file path to a Rust module file name.
+/// Convert a proto package name to its `.mod.rs` stitcher filename.
 ///
-/// e.g., "google/protobuf/timestamp.proto" → "google.protobuf.timestamp.rs"
-/// Convert a proto file path to a generated Rust file name.
+/// e.g., `"google.protobuf"` → `"google.protobuf.mod.rs"`. The unnamed
+/// package uses the [`SENTINEL_MOD`](context::SENTINEL_MOD) name as its
+/// filename stem — `package __buffa;` is already rejected by
+/// [`validate_file`], so the unnamed-package stitcher cannot
+/// collide with any real package's.
+pub fn package_to_mod_filename(package: &str) -> String {
+    if package.is_empty() {
+        format!("{}.mod.rs", context::SENTINEL_MOD)
+    } else {
+        format!("{package}.mod.rs")
+    }
+}
+
+/// Convert a `.proto` file path to its content-file stem.
 ///
-/// e.g., `"google/protobuf/timestamp.proto"` → `"google.protobuf.timestamp.rs"`
-pub fn proto_path_to_rust_module(proto_path: &str) -> String {
+/// e.g., `"google/protobuf/timestamp.proto"` → `"google.protobuf.timestamp"`.
+/// The five content files append `""`, `".__view"`, `".__oneof"`,
+/// `".__view_oneof"`, `".__ext"` plus `".rs"`.
+pub fn proto_path_to_stem(proto_path: &str) -> String {
     let without_ext = proto_path.strip_suffix(".proto").unwrap_or(proto_path);
-    format!("{}.rs", without_ext.replace('/', "."))
+    without_ext.replace('/', ".")
 }
 
 /// Code generation error.
@@ -677,32 +879,17 @@ pub enum CodeGenError {
         name_b: String,
         module_name: String,
     },
-    /// The `{Name}Oneof` identifier buffa would emit for a oneof collides
-    /// with another name in the parent message's Rust module (a nested
-    /// message, a nested enum, or — when view generation is enabled — a
-    /// `{Name}OneofView`-equivalent sibling). Resolve by renaming the
-    /// oneof or the colliding nested type in the `.proto`.
+    /// A proto package segment, message name, or file-level enum name
+    /// would emit a Rust item matching the reserved sentinel `__buffa`.
+    ///
+    /// This is the only name buffa reserves in user namespace. Resolve by
+    /// renaming the proto element.
     #[error(
-        "name conflict in '{scope}': oneof '{oneof_name}' would emit as \
-         '{attempted}', but that name already names another item in the \
-         enclosing scope"
+        "reserved name '{name}' at {location}: this name is reserved for \
+         buffa's generated ancillary types (views, oneof enums, \
+         extensions). Rename the proto element."
     )]
-    OneofNameConflict {
-        scope: String,
-        oneof_name: String,
-        attempted: String,
-    },
-    /// A message named `FooView` collides with the generated view type for
-    /// message `Foo`.
-    #[error(
-        "name conflict in '{scope}': message '{view_msg}' collides with \
-         the generated view type for message '{owned_msg}'"
-    )]
-    ViewNameConflict {
-        scope: String,
-        owned_msg: String,
-        view_msg: String,
-    },
+    ReservedModuleName { name: String, location: String },
     /// The input contains a message with `option message_set_wire_format = true`
     /// but [`CodeGenConfig::allow_message_set`] was not set.
     #[error(

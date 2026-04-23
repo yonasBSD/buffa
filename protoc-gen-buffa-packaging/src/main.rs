@@ -1,15 +1,13 @@
-//! protoc-gen-buffa-packaging — emits a `mod.rs` module tree for buffa-style
-//! per-file output.
+//! protoc-gen-buffa-packaging — emits a `mod.rs` module tree for buffa's
+//! per-package `<pkg>.mod.rs` stitcher output.
 //!
-//! This plugin reads the proto package structure (not message/service bodies)
-//! and writes a `mod.rs` that `include!`s each generated file at the right
-//! module nesting. Requires `strategy: all` so the plugin sees the full file
-//! set in a single invocation.
-//!
-//! Works with any codegen plugin that emits per-file output named via
-//! [`buffa_codegen::proto_path_to_rust_module`] (`foo/v1/bar.proto` →
-//! `foo.v1.bar.rs`). This includes `protoc-gen-buffa` itself and plugins
-//! layered on top of it.
+//! This plugin reads the proto package structure (not message/service
+//! bodies) and writes a `mod.rs` that `include!`s each per-package
+//! stitcher (see [`buffa_codegen::package_to_mod_filename`]) at the right
+//! module nesting. The per-proto content files are reached transitively
+//! via `include!` from the stitchers, so this plugin only wires up one
+//! file per package. Requires `strategy: all` so the plugin sees the full
+//! file set in a single invocation.
 //!
 //! # buf.gen.yaml
 //!
@@ -29,9 +27,9 @@
 //!
 //! # Options
 //!
-//! - `filter=services` — only include proto files that declare at least one
-//!   `service`. Useful when packaging output from a service-stub generator
-//!   that skips files without services.
+//! - `filter=services` — only include packages where at least one
+//!   `.proto` declares a `service`. Useful when packaging output from a
+//!   service-stub generator that skips files without services.
 //!
 //! Invoke the plugin once per output tree — use multiple entries in
 //! buf.gen.yaml with different `out:` directories and filters to package
@@ -39,16 +37,17 @@
 //!
 //! # Matching a codegen plugin's output set
 //!
-//! This plugin cannot see the filesystem — it derives the set of files to
-//! `include!` from `file_to_generate` and the chosen filter. The filter
-//! must produce the same set the codegen plugin actually emitted, or the
-//! `mod.rs` will reference nonexistent files (or miss real ones).
+//! This plugin cannot see the filesystem — it derives the set of packages
+//! to `include!` from `file_to_generate` and the chosen filter. The
+//! filter must produce the same set the codegen plugin actually emitted,
+//! or the `mod.rs` will reference nonexistent stitchers (or miss real
+//! ones).
 //!
-//! `protoc-gen-buffa` emits one file per proto file unconditionally, so no
-//! filter is needed. A service-stub generator that skips files without a
-//! `service` declaration needs `filter=services`. If a codegen plugin's
-//! skip condition is not expressible as a predicate on `FileDescriptorProto`,
-//! it is not packageable by this plugin.
+//! `protoc-gen-buffa` emits a stitcher for every package unconditionally,
+//! so no filter is needed. A service-stub generator that skips packages
+//! without a `service` declaration needs `filter=services`. If a codegen
+//! plugin's skip condition is not expressible as a predicate on
+//! `FileDescriptorProto`, it is not packageable by this plugin.
 
 use std::io::{self, Read, Write};
 
@@ -113,27 +112,26 @@ fn run() -> Result<(), String> {
 fn generate(request: &CodeGeneratorRequest) -> Result<CodeGeneratorResponse, String> {
     let filter = parse_filter(request.parameter.as_deref().unwrap_or(""))?;
 
-    let entries = request
-        .file_to_generate
-        .iter()
-        .map(|proto_name| {
-            let fd = find_descriptor(&request.proto_file, proto_name).ok_or_else(|| {
-                format!("file_to_generate entry {proto_name:?} has no FileDescriptorProto")
-            })?;
-            if !filter.include(fd) {
-                return Ok(None);
-            }
-            let package = fd.package.as_deref().unwrap_or("");
-            Ok(Some((
-                buffa_codegen::proto_path_to_rust_module(proto_name),
-                package,
-            )))
-        })
-        .filter_map(Result::transpose)
-        .collect::<Result<Vec<(String, &str)>, String>>()?;
-
-    let borrowed: Vec<(&str, &str)> = entries.iter().map(|(f, p)| (f.as_str(), *p)).collect();
-    let content = buffa_codegen::generate_module_tree(&borrowed, "", true);
+    // Module tree wires up one `<pkg>.mod.rs` per package; collect the
+    // distinct packages of the requested files (filtered).
+    let mut packages = std::collections::BTreeSet::new();
+    for proto_name in &request.file_to_generate {
+        let fd = find_descriptor(&request.proto_file, proto_name).ok_or_else(|| {
+            format!("file_to_generate entry {proto_name:?} has no FileDescriptorProto")
+        })?;
+        if filter.include(fd) {
+            packages.insert(fd.package.as_deref().unwrap_or("").to_string());
+        }
+    }
+    let entries: Vec<(String, String)> = packages
+        .into_iter()
+        .map(|p| (buffa_codegen::package_to_mod_filename(&p), p))
+        .collect();
+    let content = buffa_codegen::generate_module_tree(
+        &entries,
+        buffa_codegen::IncludeMode::Relative(""),
+        true,
+    );
 
     Ok(CodeGeneratorResponse {
         supported_features: Some(feature_flags()),
@@ -225,29 +223,32 @@ mod tests {
             None,
             vec![
                 file("foo/v1/svc.proto", "foo.v1", true),
-                file("foo/v1/types.proto", "foo.v1", false),
+                file("bar/v1/types.proto", "bar.v1", false),
             ],
         );
         let resp = generate(&req).unwrap();
         assert_eq!(resp.file.len(), 1);
         let content = resp.file[0].content.as_deref().unwrap();
-        assert!(content.contains("foo.v1.svc.rs"));
-        assert!(content.contains("foo.v1.types.rs"));
+        // Module tree wires up one `<pkg>.mod.rs` per package.
+        assert!(content.contains("foo.v1.mod.rs"));
+        assert!(content.contains("bar.v1.mod.rs"));
     }
 
     #[test]
     fn services_filter_excludes_non_service_files() {
+        // Filter is per-file; a package is included if any file in it
+        // declares a service. `bar.v1` has no service files → excluded.
         let req = request(
             Some("filter=services"),
             vec![
                 file("foo/v1/svc.proto", "foo.v1", true),
-                file("foo/v1/types.proto", "foo.v1", false),
+                file("bar/v1/types.proto", "bar.v1", false),
             ],
         );
         let resp = generate(&req).unwrap();
         let content = resp.file[0].content.as_deref().unwrap();
-        assert!(content.contains("foo.v1.svc.rs"));
-        assert!(!content.contains("foo.v1.types.rs"));
+        assert!(content.contains("foo.v1.mod.rs"));
+        assert!(!content.contains("bar.v1.mod.rs"));
     }
 
     #[test]
