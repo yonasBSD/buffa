@@ -626,6 +626,181 @@ fn test_proto3_optional_field_name_matches_nested_enum_no_conflict() {
 }
 
 #[test]
+fn test_nested_message_named_option_does_not_shadow_prelude() {
+    // Reproduces gh#36: a nested message named `Option` shadows
+    // `core::option::Option`, causing `pub value: Option<option::Value>` to
+    // resolve to the proto struct instead of the standard library type.
+    // The codegen must emit `::core::option::Option<...>` in this scope.
+    let option_msg = DescriptorProto {
+        name: Some("Option".to_string()),
+        field: vec![
+            make_field("title", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING),
+            {
+                let mut f = make_field("int_value", 2, Label::LABEL_OPTIONAL, Type::TYPE_UINT64);
+                f.oneof_index = Some(0);
+                f
+            },
+        ],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("value".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let picker_msg = DescriptorProto {
+        name: Some("Picker".to_string()),
+        field: vec![{
+            let mut f = make_field("options", 1, Label::LABEL_REPEATED, Type::TYPE_MESSAGE);
+            f.type_name = Some(".test.option_shadow.Picker.Option".to_string());
+            f
+        }],
+        nested_type: vec![option_msg],
+        ..Default::default()
+    };
+    let mut file = proto3_file("option_shadow.proto");
+    file.package = Some("test.option_shadow".to_string());
+    file.message_type = vec![picker_msg];
+
+    let config = CodeGenConfig {
+        generate_views: false,
+        ..Default::default()
+    };
+    let result = generate(&[file], &["option_shadow.proto".to_string()], &config);
+    let files = result.expect("nested Option message should not break codegen");
+    let content = &files[0].content;
+    assert!(
+        content.contains("pub struct Option"),
+        "nested Option struct must exist: {content}"
+    );
+    // The oneof field on Option must use the fully-qualified
+    // `::core::option::Option` to avoid resolving to the proto struct.
+    assert!(
+        !content.contains("pub value: Option<"),
+        "bare Option<> in struct field would shadow core::option::Option: {content}"
+    );
+    assert!(
+        content.contains("::core::option::Option<"),
+        "must use fully-qualified ::core::option::Option: {content}"
+    );
+}
+
+#[test]
+fn test_top_level_message_named_option_qualifies_option() {
+    // A top-level message named `Option` — file-level ImportResolver should
+    // detect this and qualify all Option type references in the file.
+    let mut file = proto3_file("option_top.proto");
+    file.package = Some("pkg".to_string());
+    file.message_type = vec![
+        DescriptorProto {
+            name: Some("Option".to_string()),
+            ..Default::default()
+        },
+        DescriptorProto {
+            name: Some("Wrapper".to_string()),
+            field: vec![{
+                let mut f = make_field("tag", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+                f.proto3_optional = Some(true);
+                f.oneof_index = Some(0);
+                f
+            }],
+            oneof_decl: vec![OneofDescriptorProto {
+                name: Some("_tag".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    ];
+
+    let config = CodeGenConfig {
+        generate_views: false,
+        ..Default::default()
+    };
+    let result = generate(&[file], &["option_top.proto".to_string()], &config);
+    let files = result.expect("top-level Option should not break codegen");
+    let content = &files[0].content;
+    // The Wrapper struct must use qualified Option for its optional field.
+    assert!(
+        content.contains("::core::option::Option<"),
+        "must use fully-qualified ::core::option::Option for optional field: {content}"
+    );
+    assert!(
+        !content.contains("pub tag: Option<"),
+        "bare Option<> on Wrapper field would shadow core::option::Option: {content}"
+    );
+}
+
+#[test]
+fn test_nested_option_blocked_propagates_through_sibling_subtree() {
+    // `Outer { nested Option; nested Middle { nested Inner } }` — `Option`
+    // is declared in `mod outer`, so it shadows the prelude there AND in
+    // `mod outer::middle` via `use super::*`. The child resolver for
+    // `Middle` must inherit the parent's blocked set so that `Inner`
+    // (emitted inside `mod outer::middle`) qualifies its optional field.
+    let inner_msg = DescriptorProto {
+        name: Some("Inner".to_string()),
+        field: vec![{
+            let mut f = make_field("x", 1, Label::LABEL_OPTIONAL, Type::TYPE_INT32);
+            f.proto3_optional = Some(true);
+            f.oneof_index = Some(0);
+            f
+        }],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("_x".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let middle_msg = DescriptorProto {
+        name: Some("Middle".to_string()),
+        field: vec![{
+            let mut f = make_field("note", 1, Label::LABEL_OPTIONAL, Type::TYPE_STRING);
+            f.proto3_optional = Some(true);
+            f.oneof_index = Some(0);
+            f
+        }],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("_note".to_string()),
+            ..Default::default()
+        }],
+        nested_type: vec![inner_msg],
+        ..Default::default()
+    };
+    let outer_msg = DescriptorProto {
+        name: Some("Outer".to_string()),
+        nested_type: vec![
+            DescriptorProto {
+                name: Some("Option".to_string()),
+                ..Default::default()
+            },
+            middle_msg,
+        ],
+        ..Default::default()
+    };
+    let mut file = proto3_file("option_deep.proto");
+    file.package = Some("pkg".to_string());
+    file.message_type = vec![outer_msg];
+
+    let config = CodeGenConfig {
+        generate_views: false,
+        ..Default::default()
+    };
+    let files = generate(&[file], &["option_deep.proto".to_string()], &config)
+        .expect("nested Option sibling should not break codegen");
+    let content = &files[0].content;
+    // `Middle.note` lives in `mod outer` (Option in scope); `Inner.x` lives
+    // in `mod outer::middle` (Option in scope via `use super::*`). Both must
+    // be qualified.
+    assert!(
+        !content.contains("pub note: Option<"),
+        "Middle.note must qualify Option (sibling collision): {content}"
+    );
+    assert!(
+        !content.contains("pub x: Option<"),
+        "Inner.x must qualify Option (inherited via use super::*): {content}"
+    );
+}
+
+#[test]
 fn test_message_named_type_with_nested() {
     // Proto message named "Type" (a Rust keyword) with a nested message.
     // This must produce valid Rust: `pub mod r#type { ... }`.
