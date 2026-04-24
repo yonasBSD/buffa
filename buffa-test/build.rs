@@ -123,7 +123,7 @@ fn main() {
         .files(&["protos/edge_cases.proto"])
         .includes(&["protos/"])
         .generate_json(true)
-        .generate_views(false)
+        .generate_views(true)
         .compile()
         .expect("buffa_build failed for edge_cases.proto");
 

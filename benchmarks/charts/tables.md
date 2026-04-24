@@ -18,6 +18,15 @@
 | GoogleMessage1 | 2,594 | 1,808 (−30%) | — | 869 (−67%) | 360 (−86%) |
 | MediaFrame | 45,990 | 38,514 (−16%) | — | 10,463 (−77%) | 1,647 (−96%) |
 
+### Build + binary encode
+
+| Message | buffa | buffa (view) |
+|---------|------:|------:|
+| ApiResponse | 790 | 1,799 (+128%) |
+| LogRecord | 531 | 3,080 (+480%) |
+| AnalyticsEvent | 408 | 1,178 (+189%) |
+| GoogleMessage1 | 935 | 1,251 (+34%) |
+
 ### JSON encode
 
 | Message | buffa | prost | Go |

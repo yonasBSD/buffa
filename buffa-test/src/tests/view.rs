@@ -2,9 +2,10 @@
 //! MapView iteration, oneof views, unknown-field preservation, recursion limit.
 
 use crate::basic::__buffa::oneof;
+use crate::basic::__buffa::view::oneof as view_oneof;
 use crate::basic::__buffa::view::*;
 use crate::basic::*;
-use buffa::{Message, MessageView};
+use buffa::{Message, MessageView, ViewEncode};
 
 #[test]
 fn test_view_decodes_scalar_fields() {
@@ -270,6 +271,33 @@ fn test_compute_size_matches_encode_len() {
 }
 
 #[test]
+fn test_compute_size_matches_encode_len_view() {
+    // Covers nested-message, repeated-message, and oneof-message cached-size
+    // dispatch through MessageFieldView/Box.
+    let addr = AddressView {
+        street: "1 Main St",
+        city: "Springfield",
+        zip_code: 12345,
+        ..Default::default()
+    };
+    let view = PersonView {
+        id: 99,
+        name: "Bob",
+        tags: ["a", "b"].iter().copied().collect(),
+        address: addr.clone().into(),
+        addresses: [addr.clone()].into_iter().collect(),
+        contact: Some(view_oneof::person::Contact::HomeAddress(Box::new(addr))),
+        ..Default::default()
+    };
+    let size = view.compute_size() as usize;
+    let bytes = view.encode_to_vec();
+    assert_eq!(size, bytes.len());
+    // Round-trips through owned.
+    let owned = Person::decode(&mut bytes.as_slice()).expect("decode owned");
+    assert_eq!(owned.encode_to_vec().len(), size);
+}
+
+#[test]
 fn test_view_map_with_open_enum_value() {
     // map<string, Status> — proto3 open enum as map value.
     // Exercises EnumValue<E> branch in view map value type/decode codegen.
@@ -338,4 +366,220 @@ fn test_view_no_unknown_fields_all_scalar_compiles() {
     assert!(view.f_bool);
     let owned = view.to_owned_message();
     assert_eq!(owned.f_int32, 42);
+}
+
+// ── view encode ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_view_encode_roundtrip_address() {
+    let owned = Address {
+        street: "1 Infinite Loop".into(),
+        city: "Cupertino".into(),
+        zip_code: 95014,
+        ..Default::default()
+    };
+    let owned_bytes = owned.encode_to_vec();
+    let view = AddressView::decode_view(&owned_bytes).unwrap();
+    let view_bytes = view.encode_to_vec();
+    assert_eq!(owned_bytes, view_bytes);
+}
+
+#[test]
+fn test_view_encode_construct_from_borrows() {
+    let view = AddressView {
+        street: "borrowed st",
+        city: "ref town",
+        zip_code: 12345,
+        ..Default::default()
+    };
+    let bytes = view.encode_to_vec();
+    let decoded = Address::decode_from_slice(&bytes).unwrap();
+    assert_eq!(decoded.street, "borrowed st");
+    assert_eq!(decoded.city, "ref town");
+    assert_eq!(decoded.zip_code, 12345);
+}
+
+#[test]
+fn test_view_encode_roundtrip_inventory_maps() {
+    let mut owned = Inventory::default();
+    owned.stock.insert("widgets".into(), 7);
+    owned.stock.insert("gadgets".into(), 3);
+    owned.locations.insert(
+        "hq".into(),
+        Address {
+            street: "main".into(),
+            city: "metro".into(),
+            zip_code: 1,
+            ..Default::default()
+        },
+    );
+    owned.statuses.insert("hq".into(), Status::ACTIVE.into());
+    let owned_bytes = owned.encode_to_vec();
+    let view = InventoryView::decode_view(&owned_bytes).unwrap();
+    let view_bytes = view.encode_to_vec();
+    // Map ordering: HashMap iter order is unspecified, but a decoded
+    // MapView preserves wire order, so re-encoding the view of the
+    // owned encoding produces the SAME bytes.
+    assert_eq!(owned_bytes, view_bytes);
+}
+
+#[test]
+fn test_view_encode_construct_map_from_iter() {
+    let pairs = [("a", 1i32), ("b", 2)];
+    let view = InventoryView {
+        stock: pairs.iter().copied().collect(),
+        ..Default::default()
+    };
+    let bytes = view.encode_to_vec();
+    let decoded = Inventory::decode_from_slice(&bytes).unwrap();
+    assert_eq!(decoded.stock.get("a"), Some(&1));
+    assert_eq!(decoded.stock.get("b"), Some(&2));
+}
+
+#[test]
+fn test_view_encode_oneof_roundtrip() {
+    // String variant.
+    let mut owned = Person::default();
+    owned.contact = Some(oneof::person::Contact::Email("a@b.c".into()));
+    let owned_bytes = owned.encode_to_vec();
+    let view = PersonView::decode_view(&owned_bytes).unwrap();
+    assert_eq!(owned_bytes, view.encode_to_vec());
+
+    // Nested-message variant — exercises ViewEncode dispatch through Box<View>.
+    let mut owned = Person::default();
+    owned.contact = Some(oneof::person::Contact::HomeAddress(Box::new(Address {
+        street: "1 main".into(),
+        city: "metro".into(),
+        zip_code: 9,
+        ..Default::default()
+    })));
+    let owned_bytes = owned.encode_to_vec();
+    let view = PersonView::decode_view(&owned_bytes).unwrap();
+    assert_eq!(owned_bytes, view.encode_to_vec());
+}
+
+#[test]
+fn test_view_encode_repeated_nested_and_oneof_from_borrows() {
+    use buffa::{MessageFieldView, RepeatedView};
+    let addr = AddressView {
+        street: "x",
+        city: "y",
+        zip_code: 9,
+        ..Default::default()
+    };
+    let view = PersonView {
+        tags: RepeatedView::new(vec!["t1", "t2"]),
+        lucky_numbers: RepeatedView::new(vec![7, 11]),
+        address: MessageFieldView::set(addr.clone()),
+        addresses: RepeatedView::new(vec![addr.clone()]),
+        contact: Some(view_oneof::person::Contact::HomeAddress(Box::new(addr))),
+        ..Default::default()
+    };
+    let bytes = view.encode_to_vec();
+    let decoded = Person::decode_from_slice(&bytes).unwrap();
+    assert_eq!(decoded.tags, ["t1", "t2"]);
+    assert_eq!(decoded.lucky_numbers, [7, 11]);
+    assert_eq!(decoded.address.street, "x");
+    assert_eq!(decoded.addresses[0].zip_code, 9);
+    let Some(oneof::person::Contact::HomeAddress(a)) = &decoded.contact else {
+        panic!("expected HomeAddress variant")
+    };
+    assert_eq!(a.city, "y");
+}
+
+#[test]
+fn test_view_encode_compute_size_matches_len() {
+    let owned = Address {
+        street: "1 Infinite Loop".into(),
+        city: "Cupertino".into(),
+        zip_code: 95014,
+        ..Default::default()
+    };
+    let bytes = owned.encode_to_vec();
+    let view = AddressView::decode_view(&bytes).unwrap();
+    assert_eq!(view.compute_size() as usize, view.encode_to_vec().len());
+}
+
+#[test]
+fn test_view_encode_proto2_groups_roundtrip() {
+    use crate::proto2::__buffa::view::WithGroupsView;
+    use crate::proto2::{with_groups, WithGroups};
+    let owned = WithGroups {
+        mygroup: with_groups::MyGroup {
+            a: Some(7),
+            b: Some("inner".into()),
+            ..Default::default()
+        }
+        .into(),
+        item: vec![
+            with_groups::Item {
+                id: Some(1),
+                name: Some("first".into()),
+                ..Default::default()
+            },
+            with_groups::Item {
+                id: Some(2),
+                name: Some("second".into()),
+                ..Default::default()
+            },
+        ],
+        label: Some("alongside".into()),
+        ..Default::default()
+    };
+    let owned_bytes = owned.encode_to_vec();
+    let view = WithGroupsView::decode_view(&owned_bytes).unwrap();
+    let view_bytes = view.encode_to_vec();
+    assert_eq!(owned_bytes, view_bytes);
+    assert_eq!(view.compute_size() as usize, view_bytes.len());
+}
+
+#[test]
+fn test_view_encode_proto2_oneof_group_closed_enum_roundtrip() {
+    use crate::proto2::__buffa::oneof::view_coverage as vc_oneof;
+    use crate::proto2::__buffa::view::ViewCoverageView;
+    use crate::proto2::{view_coverage, Priority, ViewCoverage};
+    let mut owned = ViewCoverage {
+        level: Priority::HIGH,
+        choice: Some(vc_oneof::Choice::Payload(Box::new(
+            view_coverage::Payload {
+                x: Some(42),
+                y: Some("oneof-group".into()),
+                ..Default::default()
+            },
+        ))),
+        ..Default::default()
+    };
+    owned.by_id.insert(10, "ten".into());
+    owned.priorities.insert("k".into(), Priority::LOW);
+    let owned_bytes = owned.encode_to_vec();
+    let view = ViewCoverageView::decode_view(&owned_bytes).unwrap();
+    let view_bytes = view.encode_to_vec();
+    assert_eq!(owned_bytes, view_bytes);
+    // Re-decode through owned to confirm semantic equality, not just byte
+    // identity (which here happens to hold because each map has 1 entry).
+    let redecoded = ViewCoverage::decode_from_slice(&view_bytes).unwrap();
+    assert_eq!(redecoded, owned);
+}
+
+#[test]
+fn test_view_encode_closed_enum_unknown_value_preserved() {
+    // Unknown closed-enum value on the wire: view decode cannot represent
+    // 99 as a `Priority` so the typed `level` field stays at default and the
+    // raw bytes go to UnknownFieldsView. ViewEncode must re-emit those
+    // unknown bytes so a downstream owned decoder sees the same result as
+    // decoding the original wire directly.
+    use crate::proto2::__buffa::view::ViewCoverageView;
+    use crate::proto2::{Priority, ViewCoverage};
+    // field 1 (level) varint = tag 0x08, value 99 (not a Priority variant).
+    let wire: &[u8] = &[0x08, 99];
+    let owned_direct = ViewCoverage::decode_from_slice(wire).unwrap();
+    let view = ViewCoverageView::decode_view(wire).unwrap();
+    // The typed field is NOT 99 — it's the proto2 first-variant default.
+    assert_eq!(view.level, Priority::LOW);
+    let view_bytes = view.encode_to_vec();
+    let owned_via_view = ViewCoverage::decode_from_slice(&view_bytes).unwrap();
+    assert_eq!(
+        owned_via_view, owned_direct,
+        "view-encode must preserve unknown closed-enum semantics"
+    );
 }

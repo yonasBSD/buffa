@@ -8,12 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Breaking changes
 
+- **All generated `*View<'a>` structs gain a `__buffa_cached_size` field**
+  for the new `ViewEncode` impl. Code that constructs a view literal
+  without `..Default::default()` will fail to compile; use the trailing
+  `..Default::default()` per the documented convention. Applies to WKT
+  view structs in `buffa-types` and to consumer-generated views.
 - **`google.protobuf.Any.value` is now `::bytes::Bytes` instead of `Vec<u8>`.**
   Makes `Any::clone()` a cheap refcount bump (up to ~170x faster for large
   payloads) instead of a full memcpy. Call sites constructing an `Any` by hand
   need `.into()` on the payload (e.g. `value: my_vec.into()`, or pass `Bytes`
   directly). Reading `any.value` is unchanged — `Bytes` derefs to `&[u8]`.
   `buffa-types` now depends on `bytes` unconditionally.
+
+### Added
+
+- **`ViewEncode<'a>` — serialization from borrowed view types.** Generated
+  `*View<'a>` types implement `ViewEncode` (whenever views are generated,
+  i.e. `generate_views(true)`, the default) with the same two-pass
+  `compute_size`/`write_to` model as `Message`. Views can be constructed
+  from borrowed `&'a str` / `&'a [u8]` and encoded without intermediate
+  `String`/`Vec` allocation. Benchmarks: parity on serialize-only; ~6× on
+  build+encode for a 15-label string-map message.
+- **`MapView::new(Vec)` / `From<Vec>` / `FromIterator`** for constructing
+  map views directly (for `ViewEncode`).
 
 ## [0.3.0] - 2026-04-01
 
