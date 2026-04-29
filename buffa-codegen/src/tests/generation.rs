@@ -121,6 +121,223 @@ fn test_multi_file_same_package_merged() {
 }
 
 #[test]
+fn test_package_to_filename() {
+    assert_eq!(package_to_filename("google.protobuf"), "google.protobuf.rs");
+    assert_eq!(package_to_filename("foo"), "foo.rs");
+    assert_eq!(package_to_filename(""), "__buffa.rs");
+}
+
+/// Two `.proto` files in `shared.pkg`. `a.proto` has a message with an
+/// explicit oneof and a nested type so the `__buffa::{oneof,view::oneof}`
+/// modules and per-message child modules are non-empty — needed for the
+/// module-structure parity assertions below.
+fn shared_pkg_fixture() -> ([FileDescriptorProto; 2], [String; 2]) {
+    let mut a = proto3_file("a.proto");
+    a.package = Some("shared.pkg".to_string());
+    a.message_type.push(DescriptorProto {
+        name: Some("A".to_string()),
+        field: vec![
+            FieldDescriptorProto {
+                name: Some("x".to_string()),
+                number: Some(1),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_INT32),
+                oneof_index: Some(0),
+                ..Default::default()
+            },
+            FieldDescriptorProto {
+                name: Some("y".to_string()),
+                number: Some(2),
+                label: Some(Label::LABEL_OPTIONAL),
+                r#type: Some(Type::TYPE_STRING),
+                oneof_index: Some(0),
+                ..Default::default()
+            },
+        ],
+        oneof_decl: vec![OneofDescriptorProto {
+            name: Some("kind".to_string()),
+            ..Default::default()
+        }],
+        nested_type: vec![DescriptorProto {
+            name: Some("Inner".to_string()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let mut b = proto3_file("b.proto");
+    b.package = Some("shared.pkg".to_string());
+    b.message_type.push(DescriptorProto {
+        name: Some("B".to_string()),
+        ..Default::default()
+    });
+    ([a, b], ["a.proto".to_string(), "b.proto".to_string()])
+}
+
+#[test]
+fn test_file_per_package_multi_file() {
+    let (descs, names) = shared_pkg_fixture();
+    let config = CodeGenConfig {
+        file_per_package: true,
+        ..Default::default()
+    };
+    let files = generate(&descs, &names, &config).expect("file_per_package should generate");
+    // Exactly one output file for the package — no per-proto content files.
+    assert_eq!(files.len(), 1, "expected single per-package file");
+    let pkg = &files[0];
+    assert_eq!(pkg.name, "shared.pkg.rs");
+    assert_eq!(pkg.kind, GeneratedFileKind::PackageMod);
+    // Both messages inlined; no `include!` calls.
+    assert!(pkg.content.contains("pub struct A"));
+    assert!(pkg.content.contains("pub struct B"));
+    assert!(
+        !pkg.content.contains("include!"),
+        "per-package file must inline content, not include! per-file outputs"
+    );
+    // Same `__buffa` module wrappers as the per-file stitcher.
+    assert_eq!(pkg.content.matches("pub mod __buffa {").count(), 1);
+    assert!(pkg.content.contains("pub mod view {"));
+    assert!(pkg.content.contains("pub mod oneof {"));
+    assert!(pkg.content.contains("pub mod ext {"));
+}
+
+#[test]
+fn test_file_per_package_module_structure_matches_stitcher() {
+    // The single-file output's module structure must be identical to what
+    // the per-file stitcher produces after `include!` resolution, so
+    // consumers see the same API regardless of mode.
+    let (descs, names) = shared_pkg_fixture();
+    let per_file = generate(&descs, &names, &CodeGenConfig::default()).unwrap();
+    let stitcher = per_file
+        .iter()
+        .find(|f| f.kind == GeneratedFileKind::PackageMod)
+        .unwrap();
+    let per_package = generate(
+        &descs,
+        &names,
+        &CodeGenConfig {
+            file_per_package: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let pkg = &per_package[0];
+
+    // Splice each `include!("X.rs");` in the stitcher with the matching
+    // content file's body — modeling what rustc sees after expansion.
+    // Drop the `// @generated …` / `// source: …` header so spliced
+    // content doesn't introduce comment lines mid-module.
+    fn strip_header(s: &str) -> &str {
+        s.find("\n\n").map_or(s, |i| &s[i + 2..])
+    }
+    let mut spliced = stitcher.content.clone();
+    for f in per_file
+        .iter()
+        .filter(|f| f.kind != GeneratedFileKind::PackageMod)
+    {
+        let needle = format!(r#"include!("{}");"#, f.name);
+        spliced = spliced.replace(&needle, strip_header(&f.content));
+    }
+    assert!(
+        !spliced.contains("include!"),
+        "splice missed an include: {spliced}"
+    );
+
+    // Compare the depth-aware sequence of `pub mod` declarations. Depth
+    // is brace-tracked (not indent-tracked) so the spliced content —
+    // which is not re-indented — is measured correctly.
+    let mod_decls = |s: &str| -> Vec<(usize, String)> {
+        let mut depth = 0usize;
+        let mut out = Vec::new();
+        for l in s.lines() {
+            let trimmed = l.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("pub mod ") {
+                out.push((depth, rest.trim_end_matches(" {").to_string()));
+            }
+            depth += l.matches('{').count();
+            depth = depth.saturating_sub(l.matches('}').count());
+        }
+        out
+    };
+    let spliced_mods = mod_decls(&spliced);
+    let pkg_mods = mod_decls(&pkg.content);
+    // Non-vacuous: fixture has a oneof and a nested type, so the
+    // `__buffa::oneof::a`, `__buffa::view::oneof::a`, and per-message
+    // `a` child modules are present in addition to the wrapper modules.
+    assert!(
+        spliced_mods.len() > 5,
+        "fixture should produce >5 pub mod decls, got {}: {spliced_mods:?}",
+        spliced_mods.len()
+    );
+    assert_eq!(spliced_mods, pkg_mods);
+}
+
+#[test]
+fn test_file_per_package_register_types_with_text() {
+    // `register_types` paths are package-root-relative (`super::…`) and
+    // must resolve identically when content is inlined vs `include!`d.
+    let (descs, names) = shared_pkg_fixture();
+    let config = CodeGenConfig {
+        file_per_package: true,
+        generate_text: true,
+        ..Default::default()
+    };
+    let files = generate(&descs, &names, &config).unwrap();
+    assert_eq!(files.len(), 1);
+    let content = &files[0].content;
+    assert!(
+        content.contains("pub fn register_types("),
+        "register_types fn missing: {content}"
+    );
+    assert!(
+        content.contains("reg.register_text_any(super::__A_TEXT_ANY)"),
+        "A text-any path: {content}"
+    );
+    assert!(
+        content.contains("reg.register_text_any(super::a::__INNER_TEXT_ANY)"),
+        "nested Inner text-any path: {content}"
+    );
+    assert!(
+        content.contains("reg.register_text_any(super::__B_TEXT_ANY)"),
+        "B text-any path: {content}"
+    );
+}
+
+#[test]
+fn test_file_per_package_unnamed_package() {
+    let file = proto3_file("noname.proto");
+    let config = CodeGenConfig {
+        file_per_package: true,
+        ..Default::default()
+    };
+    let files = generate(&[file], &["noname.proto".to_string()], &config)
+        .expect("unnamed package should generate");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].name, "__buffa.rs");
+}
+
+#[test]
+fn test_file_per_package_multiple_packages() {
+    // Each package gets exactly one file.
+    let mut a = proto3_file("a.proto");
+    a.package = Some("alpha".to_string());
+    let mut b = proto3_file("b.proto");
+    b.package = Some("beta".to_string());
+    let config = CodeGenConfig {
+        file_per_package: true,
+        ..Default::default()
+    };
+    let files = generate(
+        &[a, b],
+        &["a.proto".to_string(), "b.proto".to_string()],
+        &config,
+    )
+    .expect("multi-package should generate");
+    assert_eq!(files.len(), 2);
+    let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, &["alpha.rs", "beta.rs"]);
+}
+
+#[test]
 fn test_child_package_named_view_no_collision() {
     // Regression: under the pre-sentinel design, `package foo.view`
     // emitted `pub mod view { ... }` (child package) as a sibling of the
