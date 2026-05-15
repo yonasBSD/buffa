@@ -177,6 +177,7 @@ The macro pulls in `OUT_DIR/<dotted.pkg>.mod.rs`, which in turn includes the per
 | `.generate_json(bool)` | `false` | Generate serde Serialize/Deserialize for proto3 JSON |
 | `.generate_text(bool)` | `false` | Generate `impl buffa::text::TextFormat` for textproto encoding/decoding |
 | `.preserve_unknown_fields(bool)` | `true` | Preserve unknown fields for round-trip fidelity |
+| `.generate_with_setters(bool)` | `true` | Emit `with_<name>()` builder-style setters for explicit-presence fields |
 | `.generate_arbitrary(bool)` | `false` | Emit `#[derive(arbitrary::Arbitrary)]` gated behind the `arbitrary` feature (for fuzzing) |
 | `.strict_utf8_mapping(bool)` | `false` | Map `utf8_validation = NONE` string fields to `Vec<u8>` / `&[u8]` instead of `String` (see [Skipping UTF-8 validation](#skipping-utf-8-validation)) |
 | `.extern_path(proto, rust)` | — | Map a proto package to an external Rust crate (see below) |
@@ -462,6 +463,7 @@ Passed via `opt:` (works for `remote:` and `local:`):
 | `json=true` | Generate serde Serialize/Deserialize for proto3 JSON |
 | `unknown_fields=false` | Disable unknown field preservation |
 | `arbitrary=true` | Emit `#[derive(arbitrary::Arbitrary)]` for fuzzing |
+| `with_setters=false` | Disable `with_<name>()` builder-style setters for explicit-presence fields (default: emitted) |
 | `extern_path=.pkg=::rust` | Map a proto package to an external Rust path |
 | `file_per_package=true` | Emit one `<dotted.package>.rs` per package instead of per-proto-file content + a `<dotted.pkg>.mod.rs` stitcher. Use this with the remote plugin when you don't want to install `protoc-gen-buffa-packaging` — see [Remote plugin only](#remote-plugin-only-no-local-install). Under `strategy: directory`, requires the input module to be `PACKAGE_DIRECTORY_MATCH`-clean. |
 
