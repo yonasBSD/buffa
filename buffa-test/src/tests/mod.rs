@@ -40,6 +40,7 @@ mod extensions_json;
 mod idiomatic_imports;
 mod json;
 mod keyword;
+mod lazy_views;
 mod message_set;
 mod mod_collision;
 mod nesting;

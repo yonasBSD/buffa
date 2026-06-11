@@ -948,6 +948,8 @@ pub(crate) enum AncillaryKind {
     View,
     /// `__buffa::view::oneof::<msg_path>::` — view oneof enums.
     ViewOneof,
+    /// `__buffa::lazy_view::<msg_path>::` — lazy view structs.
+    LazyView,
 }
 
 impl AncillaryKind {
@@ -956,6 +958,7 @@ impl AncillaryKind {
             Self::Oneof => &["oneof"],
             Self::View => &["view"],
             Self::ViewOneof => &["view", "oneof"],
+            Self::LazyView => &["lazy_view"],
         }
     }
 }

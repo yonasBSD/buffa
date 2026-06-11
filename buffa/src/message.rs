@@ -866,6 +866,38 @@ impl DecodeOptions {
         V::decode_view_with_ctx(buf, DecodeContext::new(self.recursion_limit, &limit))
     }
 
+    /// Decode a lazy view from a byte slice (see
+    /// [`LazyMessageView`](crate::view::LazyMessageView)).
+    ///
+    /// The budgets remaining at each deferred field's position are recorded
+    /// and charged when that field is accessed, so the configured limits
+    /// flow through deferred decoding. Unlike
+    /// [`decode_view`](Self::decode_view), the unknown-field limit is not
+    /// enforced globally across the message tree at decode time: each
+    /// deferred subtree independently replays the allowance recorded at its
+    /// position, so a full traversal can materialize unknown-field records
+    /// proportional to input size. Prefer `decode_view` for untrusted input
+    /// if the global bound matters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError::MessageTooLarge`] for oversized input, or any
+    /// error from decoding the message's own fields — including
+    /// [`DecodeError::RecursionLimitExceeded`] /
+    /// [`DecodeError::UnknownFieldLimitExceeded`] when the configured limits
+    /// are exhausted by them. Deferred sub-message bytes surface errors on
+    /// access instead.
+    pub fn decode_lazy_view<'a, L: crate::view::LazyMessageView<'a>>(
+        &self,
+        buf: &'a [u8],
+    ) -> Result<L, DecodeError> {
+        if buf.len() > self.max_message_size {
+            return Err(DecodeError::MessageTooLarge);
+        }
+        let limit = core::cell::Cell::new(self.unknown_field_limit);
+        L::decode_lazy_with_ctx(buf, DecodeContext::new(self.recursion_limit, &limit))
+    }
+
     /// Decode a message by reading all bytes from a [`std::io::Read`] source.
     ///
     /// Reads until EOF, enforces `max_message_size`, then decodes the
