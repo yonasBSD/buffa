@@ -142,6 +142,18 @@ pub(crate) fn generate_view_with_nesting(
     let required = required_presence(view_scope, msg);
     let required_seen_struct_fields = &required.struct_fields;
     let required_has_methods = &required.has_methods;
+    // The `has_*` accessors live in an inherent impl; emit it only when the
+    // message has required fields (the decode loop itself is the provided
+    // `MessageView` method, so there is no other inherent impl to fold into).
+    let required_has_impl = if required.has_methods.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            impl<'a> #view_ident<'a> {
+                #(#required_has_methods)*
+            }
+        }
+    };
 
     // decode_view match arms.
     let (scalar_arms, repeated_arms, oneof_arms) = build_decode_arms(
@@ -239,12 +251,12 @@ pub(crate) fn generate_view_with_nesting(
             quote! {}
         };
 
-    // When preserving unknowns we capture `before_tag` so we can compute the
-    // raw byte span after `skip_field` advances the cursor.
-    let before_tag_capture = if ctx.config.preserve_unknown_fields {
-        quote! { let before_tag = cur; }
+    // When preserving unknowns the trait loop's `before_tag` is consumed by
+    // the unknown-field arm; otherwise bind it as `_before_tag`.
+    let before_tag_param = if ctx.config.preserve_unknown_fields {
+        format_ident!("before_tag")
     } else {
-        quote! {}
+        format_ident!("_before_tag")
     };
     let unknown_field_handling = if ctx.config.preserve_unknown_fields {
         quote! {
@@ -257,7 +269,7 @@ pub(crate) fn generate_view_with_nesting(
 
     // If no field borrows from 'a (all-scalar message with unknown-fields
     // preservation disabled), inject PhantomData<&'a ()> so the struct's
-    // lifetime param is used. _decode_ctx(buf: &'a [u8]) requires 'a.
+    // lifetime param is used. decode_view_ctx(buf: &'a [u8]) requires 'a.
     let phantom_field =
         if message_view_has_borrowing_field(ctx, msg, features, ctx.config.preserve_unknown_fields)
         {
@@ -360,65 +372,7 @@ pub(crate) fn generate_view_with_nesting(
 
         #view_debug_impl
 
-        impl<'a> #view_ident<'a> {
-            /// Decode from `buf` under the limits carried by `ctx` (recursion
-            /// depth and the shared unknown-field allowance).
-            ///
-            /// Called by [`::buffa::MessageView::decode_view`] with a fresh
-            /// default context and by generated sub-message decode arms with
-            /// `ctx.descend()?`.
-            ///
-            /// **Not part of the public API.** Named with a leading underscore to
-            /// signal that it is for generated-code use only.
-            #[doc(hidden)]
-            pub fn _decode_ctx(
-                buf: &'a [u8],
-                ctx: ::buffa::DecodeContext<'_>,
-            ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-                let mut view = Self::default();
-                view._merge_into_view(buf, ctx)?;
-                ::core::result::Result::Ok(view)
-            }
-
-            /// Merge fields from `buf` into this view (proto merge semantics).
-            ///
-            /// Repeated fields append; singular fields last-wins; singular
-            /// MESSAGE fields merge recursively. Used by sub-message decode
-            /// arms when the same field appears multiple times on the wire.
-            ///
-            /// **Not part of the public API.**
-            #[doc(hidden)]
-            pub fn _merge_into_view(
-                &mut self,
-                buf: &'a [u8],
-                ctx: ::buffa::DecodeContext<'_>,
-            ) -> ::core::result::Result<(), ::buffa::DecodeError> {
-                // `ctx` may be unused for messages with no nested sub-message
-                // fields and no unknown-field preservation.
-                let _ = ctx;
-                // Rebind as `view` so the arm-generating functions (which emit
-                // `view.#ident`) work unchanged.
-                #[allow(unused_variables)]
-                let view = self;
-                let mut cur: &'a [u8] = buf;
-                while !cur.is_empty() {
-                    #before_tag_capture
-                    let tag = ::buffa::encoding::Tag::decode(&mut cur)?;
-                    match tag.field_number() {
-                        #(#scalar_arms)*
-                        #(#repeated_arms)*
-                        #(#oneof_arms)*
-                        _ => {
-                            ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                            #unknown_field_handling
-                        }
-                    }
-                }
-                ::core::result::Result::Ok(())
-            }
-
-            #(#required_has_methods)*
-        }
+        #required_has_impl
 
         impl<'a> ::buffa::MessageView<'a> for #view_ident<'a> {
             type Owned = #owned_path;
@@ -427,7 +381,7 @@ pub(crate) fn generate_view_with_nesting(
                 buf: &'a [u8],
             ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
                 let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
-                Self::_decode_ctx(
+                <Self as ::buffa::MessageView>::decode_view_ctx(
                     buf,
                     ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
                 )
@@ -437,7 +391,35 @@ pub(crate) fn generate_view_with_nesting(
                 buf: &'a [u8],
                 ctx: ::buffa::DecodeContext<'_>,
             ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-                Self::_decode_ctx(buf, ctx)
+                <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+            }
+
+            fn merge_view_field(
+                &mut self,
+                tag: ::buffa::encoding::Tag,
+                cur: &'a [u8],
+                #before_tag_param: &'a [u8],
+                ctx: ::buffa::DecodeContext<'_>,
+            ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+                // `ctx` may be unused for messages with no nested sub-message
+                // fields and no unknown-field preservation.
+                let _ = ctx;
+                // Rebind as `view` so the arm-generating functions (which emit
+                // `view.#ident`) work unchanged. The slice-state-in/out shape
+                // keeps the `&mut cur` borrows local to each arm.
+                #[allow(unused_variables)]
+                let view = self;
+                let mut cur = cur;
+                match tag.field_number() {
+                    #(#scalar_arms)*
+                    #(#repeated_arms)*
+                    #(#oneof_arms)*
+                    _ => {
+                        ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                        #unknown_field_handling
+                    }
+                }
+                ::core::result::Result::Ok(cur)
             }
 
             fn to_owned_message(
@@ -724,7 +706,7 @@ pub(crate) fn oneof_view_needs_lifetime(
 /// Repeated, map, string, bytes, message, group fields all use `'a`.
 /// Only an all-scalar/enum message with `preserve_unknown_fields=false`
 /// has no borrowing fields — in that case a PhantomData marker is needed
-/// to keep the `<'a>` lifetime valid for `_decode_ctx(buf: &'a [u8])`.
+/// to keep the `<'a>` lifetime valid for `decode_view_ctx(buf: &'a [u8])`.
 pub(crate) fn message_view_has_borrowing_field(
     ctx: &CodeGenContext,
     msg: &DescriptorProto,
@@ -1267,9 +1249,11 @@ pub(crate) fn scalar_decode_arm(
                 // Proto merge semantics: if this field appeared before,
                 // merge the new bytes into the existing view.
                 match view.#ident.as_mut() {
-                    Some(existing) => existing._merge_into_view(sub, __sub_ctx)?,
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
                     None => view.#ident = ::buffa::MessageFieldView::set(
-                        #vt::_decode_ctx(sub, __sub_ctx)?
+                        <#vt as ::buffa::MessageView>::decode_view_ctx(sub, __sub_ctx)?
                     ),
                 }
             }
@@ -1280,9 +1264,11 @@ pub(crate) fn scalar_decode_arm(
                 let __sub_ctx = ctx.descend()?;
                 let sub = ::buffa::types::borrow_group(&mut cur, #field_number, __sub_ctx.depth())?;
                 match view.#ident.as_mut() {
-                    Some(existing) => existing._merge_into_view(sub, __sub_ctx)?,
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
                     None => view.#ident = ::buffa::MessageFieldView::set(
-                        #vt::_decode_ctx(sub, __sub_ctx)?
+                        <#vt as ::buffa::MessageView>::decode_view_ctx(sub, __sub_ctx)?
                     ),
                 }
             }
@@ -1327,7 +1313,7 @@ pub(crate) fn repeated_decode_arm(
                 #ld_check
                 let __sub_ctx = ctx.descend()?;
                 let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                view.#ident.push(#vt::_decode_ctx(sub, __sub_ctx)?);
+                view.#ident.push(<#vt as ::buffa::MessageView>::decode_view_ctx(sub, __sub_ctx)?);
             }
         });
     }
@@ -1344,7 +1330,7 @@ pub(crate) fn repeated_decode_arm(
                 #sg_check
                 let __sub_ctx = ctx.descend()?;
                 let sub = ::buffa::types::borrow_group(&mut cur, #field_number, __sub_ctx.depth())?;
-                view.#ident.push(#vt::_decode_ctx(sub, __sub_ctx)?);
+                view.#ident.push(<#vt as ::buffa::MessageView>::decode_view_ctx(sub, __sub_ctx)?);
             }
         });
     }
@@ -1544,7 +1530,7 @@ fn map_view_entry_decode(
             quote! {
                 let __sub_ctx = ctx.descend()?;
                 let sub = ::buffa::types::borrow_bytes(&mut entry_cur)?;
-                #var = #vt::_decode_ctx(sub, __sub_ctx)?;
+                #var = <#vt as ::buffa::MessageView>::decode_view_ctx(sub, __sub_ctx)?;
             }
         }
         _ => {
@@ -1597,11 +1583,15 @@ pub(crate) fn oneof_decode_arms(
                             let __sub_ctx = ctx.descend()?;
                             let sub = ::buffa::types::borrow_bytes(&mut cur)?;
                             if let Some(#view_enum::#variant(ref mut existing)) = view.#field_ident {
-                                existing._merge_into_view(sub, __sub_ctx)?;
+                                ::buffa::MessageView::merge_into_view(
+                                    &mut **existing,
+                                    sub,
+                                    __sub_ctx,
+                                )?;
                             } else {
                                 view.#field_ident = Some(#view_enum::#variant(
                                     ::buffa::alloc::boxed::Box::new(
-                                        #vt::_decode_ctx(sub, __sub_ctx)?
+                                        <#vt as ::buffa::MessageView>::decode_view_ctx(sub, __sub_ctx)?
                                     )
                                 ));
                             }
@@ -1616,11 +1606,15 @@ pub(crate) fn oneof_decode_arms(
                             let __sub_ctx = ctx.descend()?;
                             let sub = ::buffa::types::borrow_group(&mut cur, #field_number, __sub_ctx.depth())?;
                             if let Some(#view_enum::#variant(ref mut existing)) = view.#field_ident {
-                                existing._merge_into_view(sub, __sub_ctx)?;
+                                ::buffa::MessageView::merge_into_view(
+                                    &mut **existing,
+                                    sub,
+                                    __sub_ctx,
+                                )?;
                             } else {
                                 view.#field_ident = Some(#view_enum::#variant(
                                     ::buffa::alloc::boxed::Box::new(
-                                        #vt::_decode_ctx(sub, __sub_ctx)?
+                                        <#vt as ::buffa::MessageView>::decode_view_ctx(sub, __sub_ctx)?
                                     )
                                 ));
                             }
