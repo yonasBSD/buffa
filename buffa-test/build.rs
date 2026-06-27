@@ -22,6 +22,17 @@ fn main() {
         .compile()
         .expect("buffa_build failed for box_type.proto");
 
+    // PointerRepr::Inline default: every non-recursive singular message field
+    // is the built-in inline pointer (`::buffa::Inline<T>`) with no config
+    // knob. The `self_ref` field is recursive and must be silently kept on
+    // `Box` — the crate compiling proves the recursion guard works on the
+    // default config (an inlined `self_ref` would E0072).
+    buffa_build::Config::new()
+        .files(&["protos/inline_field.proto"])
+        .includes(&["protos/"])
+        .compile()
+        .expect("buffa_build failed for inline_field.proto");
+
     // views(false) + vtable: owned-message vtable reflection is self-contained,
     // so it must compile without view generation (only owned impls emitted).
     buffa_build::Config::new()

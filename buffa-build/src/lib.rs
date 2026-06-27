@@ -1049,9 +1049,15 @@ impl Config {
     }
 
     /// Map the matching message fields to a [`PointerRepr`] other than the
-    /// default `Box`. Rules are matched with proto-segment-aware prefix logic;
-    /// the **last** matching rule wins, so add a broad rule first and narrower
-    /// overrides after.
+    /// default `Inline`. Rules are matched with proto-segment-aware prefix
+    /// logic; the **last** matching rule wins, so add a broad rule first and
+    /// narrower overrides after. A leading dot is added to each path if
+    /// missing.
+    ///
+    /// The default `Inline` is recursion-aware (recursive fields stay on
+    /// `Box`), so this knob is for opting *out*: `PointerRepr::Box` for large
+    /// or rarely-set submessages where reserving `size_of::<T>()` in the parent
+    /// is wasteful, or `PointerRepr::Custom` for a third-party pointer.
     ///
     /// Applies to singular (and proto2 optional/required) message fields and to
     /// **boxed** oneof message/group variants (matched by the variant's path).
@@ -1069,15 +1075,25 @@ impl Config {
     pub fn box_type_in(mut self, repr: PointerRepr, paths: &[impl AsRef<str>]) -> Self {
         self.codegen_config
             .pointer_fields
-            .extend(paths.iter().map(|p| (p.as_ref().to_string(), repr.clone())));
+            .extend(paths.iter().map(|p| {
+                let p = p.as_ref();
+                // Normalize to the leading-dot form: matching and the
+                // exact-path Inline recursion error both depend on it.
+                let p = if p.starts_with('.') {
+                    p.to_string()
+                } else {
+                    format!(".{p}")
+                };
+                (p, repr.clone())
+            }));
         self
     }
 
     /// Map every message field (and boxed oneof variant) to the given [`PointerRepr`].
     /// Convenience for `.box_type_in(repr, &["."])`. Call before any
-    /// [`box_type_in`](Self::box_type_in) overrides, since the last matching rule
-    /// wins. An inline pointer inflates each parent struct, so prefer narrow
-    /// rules over a blanket default.
+    /// [`box_type_in`](Self::box_type_in) overrides, since the last matching
+    /// rule wins. `box_type(PointerRepr::Box)` restores the pre-0.9 boxed
+    /// default for every singular message field.
     #[must_use]
     pub fn box_type(mut self, repr: PointerRepr) -> Self {
         self.codegen_config
@@ -1845,6 +1861,22 @@ mod tests {
         assert_eq!(names.views, "zero-copy");
         assert_eq!(names.text, "textproto");
         assert_eq!(names.reflect, "reflection");
+    }
+
+    #[test]
+    fn box_type_in_normalizes_leading_dot() {
+        // Without normalization a dotless path would silently match nothing,
+        // and the exact-path Inline recursion error would never fire for it.
+        let config = Config::new()
+            .box_type_in(PointerRepr::Box, &["my.pkg.Msg.inner", ".my.pkg.Other"])
+            .codegen_config;
+        assert_eq!(
+            config.pointer_fields,
+            vec![
+                (".my.pkg.Msg.inner".to_string(), PointerRepr::Box),
+                (".my.pkg.Other".to_string(), PointerRepr::Box),
+            ]
+        );
     }
 
     #[test]

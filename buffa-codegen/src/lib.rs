@@ -527,11 +527,23 @@ impl MapRepr {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum PointerRepr {
-    /// `::buffa::alloc::boxed::Box<T>` (inside `MessageField<T>`) — the default.
-    /// Keeps generated output byte-identical to a build without the knob (the
-    /// `MessageField` pointer type parameter defaults to `Box`).
-    #[default]
+    /// `::buffa::alloc::boxed::Box<T>` (inside `MessageField<T>`). The opt-out
+    /// from the `Inline` default for large or rarely-set submessages, via
+    /// `box_type_in(PointerRepr::Box, paths)` (or `box_type(PointerRepr::Box)`
+    /// to restore the pre-0.9 global default).
     Box,
+    /// `::buffa::Inline<T>` — store the message directly in the parent struct,
+    /// no heap allocation. `MessageField<T, Inline<T>>` is laid out as
+    /// `Option<T>`. The default.
+    ///
+    /// Recursion-aware: a singular field that would form an infinite-size cycle
+    /// (directly, mutually, or via an
+    /// [`unbox_oneof`](CodeGenConfig::unboxed_oneof_fields)-inlined oneof
+    /// variant) is silently kept on `Box`, so the default is always sized. An
+    /// *exact-path* `Inline` rule that names a recursive field is rejected at
+    /// codegen time.
+    #[default]
+    Inline,
     /// A custom pointer named by a Rust type-path **template** with a `*`
     /// placeholder for the message type. Must satisfy `buffa::ProtoBox<T>` and
     /// be a crate-local newtype.
@@ -572,6 +584,7 @@ impl PointerRepr {
         use quote::quote;
         match self {
             PointerRepr::Box => Ok(quote! { #message_field<#inner> }),
+            PointerRepr::Inline => Ok(quote! { #message_field<#inner, ::buffa::Inline<#inner>> }),
             PointerRepr::Custom(template) => {
                 let ptr = parse_wildcard_type_path(template, inner)?;
                 Ok(quote! { #message_field<#inner, #ptr> })
@@ -595,6 +608,9 @@ impl PointerRepr {
         use quote::quote;
         match self {
             PointerRepr::Box => Ok(quote! { ::buffa::MessageField::<#inner> }),
+            PointerRepr::Inline => {
+                Ok(quote! { ::buffa::MessageField::<#inner, ::buffa::Inline<#inner>> })
+            }
             PointerRepr::Custom(template) => {
                 let ptr = parse_wildcard_type_path(template, inner)?;
                 Ok(quote! { ::buffa::MessageField::<#inner, #ptr> })
@@ -618,6 +634,7 @@ impl PointerRepr {
         use quote::quote;
         match self {
             PointerRepr::Box => Ok(quote! { ::buffa::alloc::boxed::Box<#inner> }),
+            PointerRepr::Inline => Ok(quote! { ::buffa::Inline<#inner> }),
             PointerRepr::Custom(template) => parse_wildcard_type_path(template, inner),
         }
     }
@@ -638,6 +655,7 @@ impl PointerRepr {
         use quote::quote;
         match self {
             PointerRepr::Box => Ok(quote! { ::buffa::alloc::boxed::Box::new(#value) }),
+            PointerRepr::Inline => Ok(quote! { ::buffa::Inline(#value) }),
             PointerRepr::Custom(template) => {
                 let ptr = parse_wildcard_type_path(template, inner)?;
                 Ok(quote! { <#ptr as ::buffa::ProtoBox<#inner>>::new(#value) })
